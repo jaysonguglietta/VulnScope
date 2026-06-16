@@ -11,6 +11,7 @@ try {
   assert(index.headers["content-security-policy"]?.includes("frame-ancestors 'none'"), "missing CSP frame protection");
   assert(index.headers["x-content-type-options"] === "nosniff", "missing nosniff header");
   assert(index.body.includes("VulnScope"), "index should include VulnScope brand");
+  assert(index.body.includes("sbomInput"), "index should include SBOM upload input");
 
   const health = request("/api/health");
   assert(health.status === 200, `expected /api/health to return 200, got ${health.status}`);

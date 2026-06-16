@@ -4,6 +4,8 @@ VulnScope is hardened for local use by default. It binds to `127.0.0.1`, keeps s
 
 Authentication and request logging are intentionally not included yet.
 
+SBOM uploads are parsed locally in the browser session. The current SBOM workflow does not send uploaded files to the backend, S3, Lambda, or any third-party source. The app extracts components, package URLs, CPEs, embedded vulnerability rows, and CVE IDs client-side, then lets the analyst launch CVE research against selected findings.
+
 ## Production AWS Deployment
 
 Live site: `https://vulnscope.jsontechnology.com`
@@ -108,6 +110,18 @@ The public deployment currently runs without optional source API tokens. VulnSco
 - `VULNCHECK_API_TOKEN`
 
 Do not commit these values. If the production deployment needs them, prefer AWS Secrets Manager or encrypted Lambda environment variables with tightly scoped IAM access. Avoid storing long-lived personal tokens directly in CloudFormation parameters.
+
+## SBOM Upload Handling
+
+Supported SBOM inputs:
+
+- CycloneDX JSON and XML
+- SPDX JSON and tag-value
+- Syft JSON
+- Grype vulnerability JSON
+- Generic text or JSON files with embedded CVE IDs
+
+Current limits are browser-side safety controls: up to 10 files per upload batch, 10 MB per file, and 40 MB total per batch. SBOM reports are kept only in memory for the current browser session and can be cleared from the sidebar. They are not persisted to local storage.
 
 ## Local Run
 

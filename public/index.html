@@ -25,6 +25,16 @@
 
         <div class="sidebar-section">
           <div class="section-heading">
+            <h2>SBOM Uploads</h2>
+            <button id="sbomClear" class="icon-button" type="button" title="Clear SBOM uploads" aria-label="Clear SBOM uploads">C</button>
+          </div>
+          <label class="upload-button" for="sbomInput">Upload SBOM</label>
+          <input id="sbomInput" class="sr-only" type="file" multiple accept=".json,.xml,.spdx,.cdx,.bom,.txt,application/json,application/xml,text/xml,text/plain">
+          <div id="sbomList" class="case-list" aria-live="polite"></div>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="section-heading">
             <h2>Watchlist</h2>
             <button id="watchRefreshAll" class="icon-button" type="button" title="Refresh watchlist" aria-label="Refresh watchlist">W</button>
           </div>
@@ -73,6 +83,9 @@
           <p class="eyebrow">Ready</p>
           <h2>Paste a CVE to generate an evidence-backed triage brief.</h2>
           <p>VulnScope will query public vulnerability sources, synthesize risk signals, collect references, and keep the work in a local case file.</p>
+          <div class="empty-actions">
+            <label class="primary-button" for="sbomInput">Upload SBOM Files</label>
+          </div>
         </div>
       </div>
     </template>

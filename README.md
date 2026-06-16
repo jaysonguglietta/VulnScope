@@ -9,6 +9,7 @@ It is designed to answer practical triage questions:
 - Is there public exploit code or exploit-related evidence?
 - What should I patch or validate?
 - Could AWS or Azure customer-managed services be affected?
+- Do my uploaded SBOM files reference affected components or known CVEs?
 
 ## Run
 
@@ -50,6 +51,7 @@ Use `.env.example` as a template and do not commit real `.env` files.
 - The in-memory CVE cache is capped at `CACHE_MAX_ENTRIES=300` with a 10 minute TTL.
 - Browser links from research sources are restricted to `http` and `https` URLs before rendering.
 - Saved cases and watchlist entries are pruned after 90 days in this browser.
+- SBOM files are parsed locally in the browser session and are not uploaded to the server.
 - Markdown and JSON exports warn before download because they can contain analyst notes and case metadata.
 - Evidence items include source reputation tiers so official records, predictive models, public code, exploit references, and chatter are separated.
 
@@ -85,6 +87,10 @@ See [docs/deployment.md](docs/deployment.md) for the live AWS resource inventory
 - Searches GitHub Issues/PRs, Hacker News, and Reddit for public chatter.
 - Produces a real-world verdict that separates confirmed exploitation, public exploit leads, and community discussion.
 - Estimates AWS and Azure exposure by separating official cloud advisory signals from possible customer-managed workload exposure.
+- Uploads one or more SBOM files and extracts components, package URLs, CPEs, vulnerability rows, and CVE IDs.
+- Supports CycloneDX JSON/XML, SPDX JSON/tag-value, Syft JSON, Grype vulnerability JSON, and generic CVE extraction from SBOM-like text.
+- Lets analysts copy SBOM CVE lists, export SBOM summaries, and research any SBOM CVE directly in VulnScope.
+- Compares loaded SBOM components against a researched CVE's affected product signals in the Impact tab.
 - Builds a risk score, evidence list, remediation checklist, and timeline.
 - Generates copy-ready remediation, detection, cloud impact, ticket, executive, and risk acceptance text.
 - Saves case notes, owner, status, and tags in browser local storage.

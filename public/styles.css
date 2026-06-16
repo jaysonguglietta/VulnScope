@@ -331,12 +331,17 @@ a:hover {
 .primary-button,
 .secondary-button,
 .ghost-button,
-.danger-button {
+.danger-button,
+.upload-button {
   border-radius: var(--radius);
   min-height: 40px;
   padding: 0 14px;
   font-weight: 700;
   border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
 }
 
 .primary-button {
@@ -352,6 +357,17 @@ a:hover {
   background: var(--panel);
   color: var(--text);
   border-color: var(--line-strong);
+}
+
+.upload-button {
+  background: #203142;
+  color: #f8fafb;
+  border-color: #3a4d61;
+}
+
+.upload-button:hover {
+  background: #26394c;
+  text-decoration: none;
 }
 
 .ghost-button {
@@ -425,6 +441,18 @@ a:hover {
 .empty-panel p:last-child {
   color: var(--muted);
   margin-bottom: 0;
+}
+
+.empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.empty-actions .primary-button {
+  color: #fff;
+  text-decoration: none;
 }
 
 .loading {
@@ -667,6 +695,17 @@ a:hover {
 
 .copy-panel .primary-button {
   flex: 0 0 auto;
+}
+
+.table-button {
+  min-height: 34px;
+  white-space: nowrap;
+}
+
+.table-note {
+  color: var(--muted);
+  margin: 10px 0 0;
+  font-size: 13px;
 }
 
 .remediation-text {
