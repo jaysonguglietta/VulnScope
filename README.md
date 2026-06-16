@@ -90,6 +90,7 @@ See [docs/deployment.md](docs/deployment.md) for the live AWS resource inventory
 - Uploads one or more SBOM files and extracts components, package URLs, CPEs, vulnerability rows, and CVE IDs.
 - Supports CycloneDX JSON/XML, SPDX JSON/tag-value, Syft JSON, Grype vulnerability JSON, and generic CVE extraction from SBOM-like text.
 - Lets analysts click an SBOM CVE to see the exact affected package rows, copy SBOM CVE lists, export SBOM summaries, and research any SBOM CVE directly in VulnScope.
+- Automatically checks loaded SBOMs for the exact CVE being researched and surfaces matching packages in the CVE report.
 - Compares loaded SBOM components against a researched CVE's affected product signals in the Impact tab.
 - Builds a risk score, evidence list, remediation checklist, and timeline.
 - Generates copy-ready remediation, detection, cloud impact, ticket, executive, and risk acceptance text.

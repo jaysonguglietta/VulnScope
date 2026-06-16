@@ -62,11 +62,14 @@ const sampleText = ${JSON.stringify(sample)};
 const parsed = parseSbomFile({ name: "sample-cyclonedx.json", size: sampleText.length }, sampleText);
 const report = buildSbomReport([parsed], []);
 const log4shell = report.cves.find((entry) => entry.id === "CVE-2021-44228");
+state.sbomReports = [report];
+const exactMatches = findSbomCveMatches("CVE-2021-44228");
 smokeAssert(parsed.format === "CycloneDX 1.5", "expected CycloneDX parser");
 smokeAssert(report.components.length === 1, "expected one component");
 smokeAssert(Boolean(log4shell), "expected Log4Shell CVE");
 smokeAssert(report.vulnerabilities.some((entry) => entry.components.some((component) => component.includes("log4j-core"))), "expected affected component mapping");
 smokeAssert(log4shell.affectedPackages.some((pkg) => pkg.name.includes("log4j-core") && pkg.version === "2.14.1"), "expected Log4Shell package mapping");
+smokeAssert(exactMatches.length === 1 && exactMatches[0].entry.id === "CVE-2021-44228", "expected exact searched-CVE SBOM match");
 `;
 
 const tempDir = mkdtempSync(join(tmpdir(), "vulnscope-sbom-test-"));

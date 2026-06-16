@@ -514,6 +514,15 @@ a:hover {
   color: #74521a;
 }
 
+.sbom-search-match {
+  border-color: #c7d1dd;
+}
+
+.sbom-search-match.found {
+  border-color: #91d3c7;
+  background: #f2fbf8;
+}
+
 .brief-title,
 .header-actions,
 .metric-grid,

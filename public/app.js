@@ -111,6 +111,9 @@ document.addEventListener("click", (event) => {
     case "open-sbom-cve":
       openSbomCve(value);
       break;
+    case "open-sbom-cve-report":
+      openSbomCveReport(action.dataset.reportId, action.dataset.cve);
+      break;
     case "refresh-watch":
       refreshWatch(value);
       break;
@@ -430,6 +433,7 @@ function removeWatch(id) {
 
 async function handleSbomFiles(files) {
   if (!files.length) return;
+  const currentInvestigation = state.current;
   const warnings = [];
   const accepted = [];
   let totalBytes = 0;
@@ -467,15 +471,16 @@ async function handleSbomFiles(files) {
   }
 
   const report = buildSbomReport(parsed, warnings);
+  const currentCveMatch = currentInvestigation?.id && report.cves.some((entry) => entry.id === currentInvestigation.id);
   state.sbomReports = [report, ...state.sbomReports].slice(0, 6);
   state.activeSbomId = report.id;
-  state.activeSbomCveId = report.cves[0]?.id || null;
-  state.current = null;
+  state.activeSbomCveId = currentCveMatch ? currentInvestigation.id : report.cves[0]?.id || null;
+  state.current = currentInvestigation || null;
   renderCases();
   renderSbomList();
   render();
   focusContent();
-  showToast(`Parsed ${report.files.length} SBOM file${report.files.length === 1 ? "" : "s"} with ${report.cves.length} CVE finding${report.cves.length === 1 ? "" : "s"}.`);
+  showToast(currentCveMatch ? `${currentInvestigation.id} found in the uploaded SBOM.` : `Parsed ${report.files.length} SBOM file${report.files.length === 1 ? "" : "s"} with ${report.cves.length} CVE finding${report.cves.length === 1 ? "" : "s"}.`);
 }
 
 function openSbom(id) {
@@ -508,6 +513,18 @@ function openSbomCve(cve) {
   const report = getActiveSbomReport();
   if (!report?.cves.some((entry) => entry.id === cve)) return;
   state.activeSbomCveId = cve;
+  render();
+}
+
+function openSbomCveReport(reportId, cve) {
+  const report = state.sbomReports.find((item) => item.id === reportId);
+  if (!report?.cves.some((entry) => entry.id === cve)) return;
+  state.activeSbomId = report.id;
+  state.activeSbomCveId = cve;
+  state.current = null;
+  elements.input.value = "";
+  renderCases();
+  renderSbomList();
   render();
 }
 
@@ -1108,6 +1125,7 @@ function render() {
 
       ${renderStaleBanner(item)}
       ${renderMetrics(item)}
+      ${renderSearchedCveSbomMatch(item)}
       ${renderTabs()}
       ${renderActiveTab(item)}
     </article>
@@ -1177,6 +1195,80 @@ function renderMetrics(item) {
         <div class="metric-value">${item.cloudImpact?.services?.length ?? 0}</div>
         <div class="metric-detail">${escapeHtml(cloudMetricLabel(item.cloudImpact))}</div>
       </div>
+    </section>
+  `;
+}
+
+function renderSearchedCveSbomMatch(item) {
+  if (!state.sbomReports.length) return "";
+  const matches = findSbomCveMatches(item.id);
+  if (!matches.length) {
+    return `
+      <section class="panel sbom-search-match">
+        <div class="panel-title-row">
+          <div>
+            <h3>Loaded SBOM Check</h3>
+            <p>${escapeHtml(item.id)} was not found as an exact CVE ID in the currently loaded SBOM files.</p>
+          </div>
+          <span class="badge">Checked ${state.sbomReports.length} upload${state.sbomReports.length === 1 ? "" : "s"}</span>
+        </div>
+      </section>
+    `;
+  }
+
+  const packageRows = dedupeBy(matches.flatMap((match) => (match.entry.affectedPackages || []).map((pkg) => ({
+    ...pkg,
+    reportId: match.report.id,
+    reportTitle: match.report.title,
+    cve: match.entry.id
+  }))), sbomAffectedPackageKey);
+
+  return `
+    <section class="panel sbom-search-match found">
+      <div class="panel-title-row">
+        <div>
+          <h3>Found in Uploaded SBOMs</h3>
+          <p>${escapeHtml(item.id)} appears in ${matches.length} loaded SBOM report${matches.length === 1 ? "" : "s"}${packageRows.length ? ` with ${packageRows.length} affected package record${packageRows.length === 1 ? "" : "s"}.` : ", but package-level mapping was not included."}</p>
+        </div>
+        <span class="badge">${packageRows.length || matches.length} match${(packageRows.length || matches.length) === 1 ? "" : "es"}</span>
+      </div>
+      ${
+        packageRows.length
+          ? `<div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Package</th>
+                    <th>Version</th>
+                    <th>Package URL / CPE</th>
+                    <th>SBOM</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${packageRows.map((pkg) => `
+                    <tr>
+                      <td><strong>${escapeHtml(pkg.name || pkg.label || "Unknown package")}</strong>${pkg.supplier ? `<br><span class="muted-cell">${escapeHtml(pkg.supplier)}</span>` : ""}</td>
+                      <td>${escapeHtml(pkg.version || "n/a")}</td>
+                      <td>${escapeHtml(pkg.purl || pkg.cpes?.[0] || "n/a")}</td>
+                      <td>${escapeHtml(pkg.fileName || pkg.reportTitle || "Loaded SBOM")}</td>
+                      <td><button class="secondary-button table-button" type="button" data-action="open-sbom-cve-report" data-report-id="${escapeAttr(pkg.reportId)}" data-cve="${escapeAttr(pkg.cve)}">View SBOM</button></td>
+                    </tr>
+                  `).join("")}
+                </tbody>
+              </table>
+            </div>`
+          : `<div class="card-grid">
+              ${matches.map((match) => `
+                <div class="action-item">
+                  <span class="badge">${escapeHtml(match.entry.severity || "Unknown severity")}</span>
+                  <strong>${escapeHtml(match.report.title)}</strong>
+                  <p>${escapeHtml(match.entry.files.join(", ") || "Loaded SBOM")}</p>
+                  <button class="secondary-button table-button" type="button" data-action="open-sbom-cve-report" data-report-id="${escapeAttr(match.report.id)}" data-cve="${escapeAttr(match.entry.id)}">View SBOM</button>
+                </div>
+              `).join("")}
+            </div>`
+      }
     </section>
   `;
 }
@@ -2334,6 +2426,15 @@ function getSelectedSbomCve(report) {
   return report.cves.find((entry) => entry.id === state.activeSbomCveId) || report.cves[0];
 }
 
+function findSbomCveMatches(cve) {
+  const normalized = normalizeCve(cve);
+  if (!normalized) return [];
+  return state.sbomReports.flatMap((report) => {
+    const entry = report.cves.find((item) => item.id === normalized);
+    return entry ? [{ report, entry }] : [];
+  });
+}
+
 function normalizeSbomComponent(component) {
   return {
     fileName: component.fileName || "",
@@ -2401,7 +2502,7 @@ function sbomComponentKey(component) {
 }
 
 function sbomAffectedPackageKey(pkg) {
-  return [pkg.fileName, pkg.name, pkg.version, pkg.purl, pkg.label].map((value) => String(value || "")).join("|");
+  return [pkg.reportId, pkg.fileName, pkg.name, pkg.version, pkg.purl, pkg.label].map((value) => String(value || "")).join("|");
 }
 
 function analyzeSbomImpact(item) {
