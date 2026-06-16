@@ -6,5 +6,6 @@ node_modules/
 npm-debug.log*
 coverage/
 dist/
+.deploy/
 .vscode/
 .idea/

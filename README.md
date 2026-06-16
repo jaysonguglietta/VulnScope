@@ -57,7 +57,24 @@ Authentication and request logging are intentionally not included yet. Do not ex
 
 ## Deployment
 
-See [docs/deployment.md](docs/deployment.md) for Docker, TLS reverse proxy, secret handling, and multi-instance rate limiting guidance.
+Production is currently deployed at [https://vulnscope.jsontechnology.com](https://vulnscope.jsontechnology.com).
+
+The AWS deployment uses the lowest-maintenance serverless option for a low-traffic site:
+
+- Route 53 hosts `jsontechnology.com` DNS.
+- CloudFront serves TLS, security headers, and global edge delivery.
+- S3 privately stores the static frontend.
+- API Gateway HTTP API routes `/api/*` requests to Lambda.
+- Lambda runs the VulnScope research API only when requests arrive.
+- CloudWatch billing alarms send email alerts at estimated monthly charges of `$10` and `$20`.
+
+Deploy updates with:
+
+```bash
+npm run deploy:aws
+```
+
+See [docs/deployment.md](docs/deployment.md) for the live AWS resource inventory, Docker/private-hosting notes, TLS reverse proxy guidance, secret handling, and multi-instance rate limiting guidance.
 
 ## What It Does
 

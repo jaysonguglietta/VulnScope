@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = resolve(__dirname, "public");
@@ -423,99 +423,105 @@ function clientSafeError(error) {
   return "Source failed.";
 }
 
-const server = createServer(async (req, res) => {
+export async function appRequestHandler(req, res) {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-
-    if (url.pathname === "/api/health") {
-      sendJson(res, {
-        ok: true,
-        generatedAt: new Date().toISOString(),
-        sources: sourceCatalog.map((source) => ({
-          id: source.id,
-          label: source.label,
-          kind: source.kind,
-          url: source.url,
-          optional: source.kind === "optional-token"
-        }))
-      });
-      return;
-    }
-
-    if (url.pathname === "/api/research") {
-      const cve = normalizeCve(url.searchParams.get("cve"));
-      const refresh = url.searchParams.get("refresh") === "1";
-      if (!cve) {
-        sendJson(
-          res,
-          {
-            error: true,
-            message: "Enter a CVE in the format CVE-YYYY-NNNN."
-          },
-          400
-        );
-        return;
-      }
-
-      const rateLimit = checkResearchRateLimit(req, refresh);
-      if (!rateLimit.allowed) {
-        sendJson(
-          res,
-          {
-            error: true,
-            message: rateLimit.message
-          },
-          429,
-          { "retry-after": String(rateLimit.retryAfterSeconds) }
-        );
-        return;
-      }
-
-      const cached = getCachedResearch(cve);
-      if (!refresh && cached) {
-        sendJson(res, { ...cached.payload, cached: true });
-        return;
-      }
-
-      if (!canAcceptResearch()) {
-        sendJson(
-          res,
-          {
-            error: true,
-            message: "The research queue is busy. Try again shortly."
-          },
-          503,
-          { "retry-after": "10" }
-        );
-        return;
-      }
-
-      const payload = await withResearchSlot(() => researchCve(cve));
-      setCachedResearch(cve, payload);
-      sendJson(res, payload);
+    const apiResponse = await handleApiRequest({
+      path: url.pathname,
+      query: url.searchParams,
+      headers: req.headers,
+      remoteAddress: req.socket?.remoteAddress
+    });
+    if (apiResponse) {
+      writeApiResponse(res, apiResponse);
       return;
     }
 
     await serveStatic(url.pathname, res);
   } catch (error) {
     console.error(error);
-    sendJson(
-      res,
-      {
-        error: true,
-        message: "The research server hit an unexpected error."
-      },
-      500
-    );
+    sendJson(res, genericServerErrorBody(), 500);
   }
-});
+}
 
-server.listen(port, host, () => {
-  console.log(`VulnScope is running at http://${host}:${port}`);
-  if (host === "0.0.0.0" || host === "::") {
-    console.warn("The server is listening on all interfaces. Put it behind TLS, access control, and rate limiting before exposing it.");
+export async function handleApiRequest({ path, query, headers = {}, remoteAddress = "unknown" }) {
+  if (path === "/api/health") {
+    return jsonApiResponse({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      sources: sourceCatalog.map((source) => ({
+        id: source.id,
+        label: source.label,
+        kind: source.kind,
+        url: source.url,
+        optional: source.kind === "optional-token"
+      }))
+    });
   }
-});
+
+  if (path === "/api/research") {
+    const cve = normalizeCve(query.get("cve"));
+    const refresh = query.get("refresh") === "1";
+    if (!cve) {
+      return jsonApiResponse(
+        {
+          error: true,
+          message: "Enter a CVE in the format CVE-YYYY-NNNN."
+        },
+        400
+      );
+    }
+
+    const rateLimit = checkResearchRateLimit({ headers, socket: { remoteAddress } }, refresh);
+    if (!rateLimit.allowed) {
+      return jsonApiResponse(
+        {
+          error: true,
+          message: rateLimit.message
+        },
+        429,
+        { "retry-after": String(rateLimit.retryAfterSeconds) }
+      );
+    }
+
+    const cached = getCachedResearch(cve);
+    if (!refresh && cached) {
+      return jsonApiResponse({ ...cached.payload, cached: true });
+    }
+
+    if (!canAcceptResearch()) {
+      return jsonApiResponse(
+        {
+          error: true,
+          message: "The research queue is busy. Try again shortly."
+        },
+        503,
+        { "retry-after": "10" }
+      );
+    }
+
+    const payload = await withResearchSlot(() => researchCve(cve));
+    setCachedResearch(cve, payload);
+    return jsonApiResponse(payload);
+  }
+
+  return null;
+}
+
+const server = createServer(appRequestHandler);
+
+if (isMainModule()) {
+  server.listen(port, host, () => {
+    console.log(`VulnScope is running at http://${host}:${port}`);
+    if (host === "0.0.0.0" || host === "::") {
+      console.warn("The server is listening on all interfaces. Put it behind TLS, access control, and rate limiting before exposing it.");
+    }
+  });
+}
+
+function isMainModule() {
+  return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+}
 
 async function serveStatic(pathname, res) {
   const requested = pathname === "/" ? "/index.html" : pathname;
@@ -2613,6 +2619,30 @@ function hash(value) {
     h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
   }
   return Math.abs(h).toString(36);
+}
+
+function jsonApiResponse(body, statusCode = 200, extraHeaders = {}) {
+  return {
+    statusCode,
+    headers: withSecurityHeaders({
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...extraHeaders
+    }),
+    body: JSON.stringify(body, null, 2)
+  };
+}
+
+function genericServerErrorBody() {
+  return {
+    error: true,
+    message: "The research server hit an unexpected error."
+  };
+}
+
+function writeApiResponse(res, response) {
+  res.writeHead(response.statusCode || 200, response.headers || {});
+  res.end(response.body || "");
 }
 
 function sendJson(res, body, statusCode = 200, extraHeaders = {}) {

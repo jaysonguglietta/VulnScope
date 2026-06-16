@@ -8,7 +8,8 @@
     "check": "node --check server.mjs",
     "check:client": "node --check public/app.js",
     "test": "node scripts/security-smoke.mjs",
-    "verify": "npm run check && npm run check:client && npm test && npm audit --omit=dev"
+    "verify": "npm run check && npm run check:client && npm test && npm audit --omit=dev",
+    "deploy:aws": "bash scripts/deploy-aws.sh"
   },
   "engines": {
     "node": ">=20"
