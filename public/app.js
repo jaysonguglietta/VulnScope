@@ -17,6 +17,7 @@ const state = {
   watchlist: loadWatchlist(),
   sbomReports: [],
   activeSbomId: null,
+  activeSbomCveId: null,
   assetInput: "",
   caseFilter: "",
   sourceHealth: [],
@@ -106,6 +107,9 @@ document.addEventListener("click", (event) => {
       break;
     case "open-sbom":
       openSbom(value);
+      break;
+    case "open-sbom-cve":
+      openSbomCve(value);
       break;
     case "refresh-watch":
       refreshWatch(value);
@@ -199,6 +203,7 @@ async function research(cve, options = {}) {
   state.loading = true;
   state.current = null;
   state.activeSbomId = null;
+  state.activeSbomCveId = null;
   state.activeTab = "overview";
   elements.input.value = normalized;
   setSearchError("");
@@ -322,6 +327,7 @@ function openCase(id) {
   if (!record) return;
   state.current = attachCaseDraft(record.investigation);
   state.activeSbomId = null;
+  state.activeSbomCveId = null;
   state.activeTab = "overview";
   elements.input.value = record.id;
   render();
@@ -359,6 +365,7 @@ function openWatch(id) {
   if (!record) return;
   state.current = attachCaseDraft(record.investigation);
   state.activeSbomId = null;
+  state.activeSbomCveId = null;
   state.activeTab = "watchlist";
   elements.input.value = record.id;
   render();
@@ -462,6 +469,7 @@ async function handleSbomFiles(files) {
   const report = buildSbomReport(parsed, warnings);
   state.sbomReports = [report, ...state.sbomReports].slice(0, 6);
   state.activeSbomId = report.id;
+  state.activeSbomCveId = report.cves[0]?.id || null;
   state.current = null;
   renderCases();
   renderSbomList();
@@ -474,6 +482,7 @@ function openSbom(id) {
   const report = state.sbomReports.find((item) => item.id === id);
   if (!report) return;
   state.activeSbomId = id;
+  state.activeSbomCveId = report.cves.some((entry) => entry.id === state.activeSbomCveId) ? state.activeSbomCveId : report.cves[0]?.id || null;
   state.current = null;
   elements.input.value = "";
   renderCases();
@@ -488,10 +497,18 @@ function clearSboms() {
   }
   state.sbomReports = [];
   state.activeSbomId = null;
+  state.activeSbomCveId = null;
   renderCases();
   renderSbomList();
   render();
   showToast("SBOM uploads cleared from this browser session.");
+}
+
+function openSbomCve(cve) {
+  const report = getActiveSbomReport();
+  if (!report?.cves.some((entry) => entry.id === cve)) return;
+  state.activeSbomCveId = cve;
+  render();
 }
 
 async function copySbomCves() {
@@ -598,6 +615,7 @@ function parseCycloneDxJson(file, json) {
       title: vulnerability.id || cve,
       description: vulnerability.description || vulnerability.detail || "",
       fileName: file.name,
+      componentRefs,
       components: componentNames,
       references: extractUrls(safeStringify(vulnerability))
     }));
@@ -703,6 +721,7 @@ function parseGrypeJson(file, json) {
       title: vulnerability.id || cve,
       description: vulnerability.description || "",
       fileName: file.name,
+      componentRefs: component.ref || component.purl ? [component.ref || component.purl] : [],
       components: component.name ? [formatSbomComponentLabel(component)] : [],
       references: normalizeArray(vulnerability.urls)
     }));
@@ -813,6 +832,7 @@ function parseCycloneDxXml(file, doc, text) {
       title: xmlText(entry, "id") || cve,
       description: xmlText(entry, "description") || xmlText(entry, "detail"),
       fileName: file.name,
+      componentRefs,
       components: componentNames,
       references: extractUrls(entry.textContent || "")
     }));
@@ -915,6 +935,7 @@ function buildSbomReport(parsedFiles, warnings = []) {
     title: cve,
     description: "CVE reference was found near this component in the SBOM.",
     fileName: component.fileName,
+    componentRefs: sbomComponentRefValues(component),
     components: [formatSbomComponentLabel(component)],
     references: []
   })));
@@ -927,6 +948,7 @@ function buildSbomReport(parsedFiles, warnings = []) {
     title: cve,
     description: "CVE reference was found in the SBOM file text.",
     fileName: file.fileName,
+    componentRefs: [],
     components: [],
     references: []
   })));
@@ -949,6 +971,7 @@ function buildSbomReport(parsedFiles, warnings = []) {
       sources: new Set(),
       severities: new Set(),
       references: new Set(),
+      affectedPackages: new Map(),
       count: 0
     };
     entry.files.add(vulnerability.fileName);
@@ -956,6 +979,9 @@ function buildSbomReport(parsedFiles, warnings = []) {
     entry.sources.add(vulnerability.source || "SBOM");
     if (vulnerability.severity) entry.severities.add(vulnerability.severity);
     for (const ref of vulnerability.references || []) entry.references.add(ref);
+    for (const affectedPackage of findSbomAffectedPackages(vulnerability, components)) {
+      entry.affectedPackages.set(sbomAffectedPackageKey(affectedPackage), affectedPackage);
+    }
     entry.count += 1;
     cveMap.set(vulnerability.cve, entry);
   }
@@ -966,6 +992,7 @@ function buildSbomReport(parsedFiles, warnings = []) {
     sources: [...entry.sources],
     severity: highestSeverity([...entry.severities]),
     references: [...entry.references].slice(0, 6),
+    affectedPackages: [...entry.affectedPackages.values()],
     count: entry.count
   })).sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || sortCveId(b.id) - sortCveId(a.id));
   const title = files.length === 1 ? stripExtension(files[0].fileName) : `${files.length} SBOM files`;
@@ -1019,6 +1046,7 @@ function clearLocalData() {
   state.watchlist = [];
   state.sbomReports = [];
   state.activeSbomId = null;
+  state.activeSbomCveId = null;
   localStorage.removeItem("cve-research-cases");
   localStorage.removeItem("cve-research-watchlist");
   if (state.current) {
@@ -1924,6 +1952,9 @@ function renderSbomWorkspace(report) {
           ${renderSbomCveTable(report)}
         </div>
         <div class="panel">
+          ${renderSbomAffectedPackages(report)}
+        </div>
+        <div class="panel">
           <h3>Vulnerability Detail</h3>
           ${renderSbomVulnerabilities(report)}
         </div>
@@ -1956,6 +1987,7 @@ function renderSbomCveTable(report) {
   if (!report.cves.length) {
     return `<p>No CVE IDs were found in the uploaded SBOM files. The component inventory was still extracted where possible.</p>`;
   }
+  const activeCve = getSelectedSbomCve(report)?.id;
   return `
     <div class="table-wrap">
       <table>
@@ -1970,10 +2002,10 @@ function renderSbomCveTable(report) {
         </thead>
         <tbody>
           ${report.cves.slice(0, SBOM_CVE_DISPLAY_LIMIT).map((entry) => `
-            <tr>
-              <td><strong>${escapeHtml(entry.id)}</strong></td>
+            <tr class="${activeCve === entry.id ? "selected-row" : ""}">
+              <td><button class="link-button" type="button" data-action="open-sbom-cve" data-value="${escapeAttr(entry.id)}" aria-pressed="${activeCve === entry.id ? "true" : "false"}">${escapeHtml(entry.id)}</button></td>
               <td>${escapeHtml(entry.severity || "Unknown")}</td>
-              <td>${escapeHtml(entry.components.slice(0, 3).join(", ") || "No component listed")}</td>
+              <td>${escapeHtml(entry.affectedPackages?.slice(0, 3).map((pkg) => pkg.label).join(", ") || entry.components.slice(0, 3).join(", ") || "No component listed")}</td>
               <td>${escapeHtml(entry.files.slice(0, 2).join(", "))}</td>
               <td><button class="secondary-button table-button" type="button" data-action="research-sbom-cve" data-value="${escapeAttr(entry.id)}">Research</button></td>
             </tr>
@@ -1982,6 +2014,56 @@ function renderSbomCveTable(report) {
       </table>
     </div>
     ${report.cves.length > SBOM_CVE_DISPLAY_LIMIT ? `<p class="table-note">Showing first ${SBOM_CVE_DISPLAY_LIMIT} CVEs. Export JSON for the full list.</p>` : ""}
+  `;
+}
+
+function renderSbomAffectedPackages(report) {
+  const selected = getSelectedSbomCve(report);
+  if (!selected) {
+    return `
+      <h3>Affected Packages</h3>
+      <p>Select a CVE above to view the package records tied to that finding.</p>
+    `;
+  }
+  const packages = selected.affectedPackages || [];
+  return `
+    <div class="panel-title-row">
+      <div>
+        <h3>Affected Packages for ${escapeHtml(selected.id)}</h3>
+        <p>${packages.length ? `${packages.length} package record${packages.length === 1 ? "" : "s"} mapped from the uploaded SBOM data.` : "This CVE was found in the SBOM, but no package-level mapping was included."}</p>
+      </div>
+      <button class="secondary-button" type="button" data-action="research-sbom-cve" data-value="${escapeAttr(selected.id)}">Research CVE</button>
+    </div>
+    ${
+      packages.length
+        ? `<div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Package</th>
+                  <th>Version</th>
+                  <th>Type</th>
+                  <th>Package URL / CPE</th>
+                  <th>Evidence</th>
+                  <th>File</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${packages.map((pkg) => `
+                  <tr>
+                    <td><strong>${escapeHtml(pkg.name || pkg.label || "Unknown package")}</strong>${pkg.supplier ? `<br><span class="muted-cell">${escapeHtml(pkg.supplier)}</span>` : ""}</td>
+                    <td>${escapeHtml(pkg.version || "n/a")}</td>
+                    <td>${escapeHtml(pkg.type || "component")}</td>
+                    <td>${escapeHtml(pkg.purl || pkg.cpes?.[0] || "n/a")}</td>
+                    <td>${escapeHtml(pkg.match || pkg.source || "SBOM mapping")}${pkg.severity ? `<br><span class="muted-cell">${escapeHtml(pkg.severity)}${pkg.score ? ` ${escapeHtml(String(pkg.score))}` : ""}</span>` : ""}</td>
+                    <td>${escapeHtml(pkg.fileName || "Unknown file")}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>`
+        : `<p>Some tools emit file-level CVE references without affected package references. Review the vulnerability detail and component inventory for additional context.</p>`
+    }
   `;
 }
 
@@ -2247,6 +2329,11 @@ function getActiveSbomReport() {
   return state.sbomReports.find((item) => item.id === state.activeSbomId) || null;
 }
 
+function getSelectedSbomCve(report) {
+  if (!report?.cves.length) return null;
+  return report.cves.find((entry) => entry.id === state.activeSbomCveId) || report.cves[0];
+}
+
 function normalizeSbomComponent(component) {
   return {
     fileName: component.fileName || "",
@@ -2260,6 +2347,61 @@ function normalizeSbomComponent(component) {
     licenses: uniqueValues(normalizeArray(component.licenses).map(String).filter(Boolean)),
     cves: uniqueValues(normalizeArray(component.cves).flatMap((value) => extractCves(value)))
   };
+}
+
+function findSbomAffectedPackages(vulnerability, components) {
+  const refs = new Set(uniqueValues(vulnerability.componentRefs || []));
+  const labels = new Set(uniqueValues(vulnerability.components || []));
+  const matchingComponents = components.filter((component) => {
+    if (component.fileName !== vulnerability.fileName) return false;
+    const refHit = sbomComponentRefValues(component).some((ref) => refs.has(ref));
+    const labelHit = labels.has(formatSbomComponentLabel(component));
+    return refHit || labelHit;
+  });
+
+  if (matchingComponents.length) {
+    return matchingComponents.map((component) => ({
+      label: formatSbomComponentLabel(component),
+      name: component.name || component.purl || component.ref || "Unknown package",
+      version: component.version || "",
+      type: component.type || "component",
+      supplier: component.supplier || "",
+      purl: component.purl || "",
+      cpes: component.cpes || [],
+      fileName: component.fileName,
+      source: vulnerability.source || "SBOM",
+      severity: vulnerability.severity || "",
+      score: vulnerability.score || "",
+      match: refs.size ? "Matched by SBOM component reference" : "Matched by SBOM component label"
+    }));
+  }
+
+  return [...labels].map((label) => ({
+    label,
+    name: label,
+    version: "",
+    type: "component",
+    supplier: "",
+    purl: "",
+    cpes: [],
+    fileName: vulnerability.fileName,
+    source: vulnerability.source || "SBOM",
+    severity: vulnerability.severity || "",
+    score: vulnerability.score || "",
+    match: "SBOM listed this component label, but no full package record was available"
+  }));
+}
+
+function sbomComponentRefValues(component) {
+  return uniqueValues([component.ref, component.purl, sbomComponentKey(component)]);
+}
+
+function sbomComponentKey(component) {
+  return [component.fileName, component.ref, component.purl, component.name, component.version].map((value) => String(value || "")).join("|");
+}
+
+function sbomAffectedPackageKey(pkg) {
+  return [pkg.fileName, pkg.name, pkg.version, pkg.purl, pkg.label].map((value) => String(value || "")).join("|");
 }
 
 function analyzeSbomImpact(item) {

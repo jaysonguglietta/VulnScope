@@ -702,10 +702,33 @@ a:hover {
   white-space: nowrap;
 }
 
+.link-button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  padding: 0;
+  font-weight: 800;
+  text-align: left;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
+.selected-row td {
+  background: #eefaf7;
+}
+
 .table-note {
   color: var(--muted);
   margin: 10px 0 0;
   font-size: 13px;
+}
+
+.muted-cell {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .remediation-text {

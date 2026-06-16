@@ -4,7 +4,7 @@ VulnScope is hardened for local use by default. It binds to `127.0.0.1`, keeps s
 
 Authentication and request logging are intentionally not included yet.
 
-SBOM uploads are parsed locally in the browser session. The current SBOM workflow does not send uploaded files to the backend, S3, Lambda, or any third-party source. The app extracts components, package URLs, CPEs, embedded vulnerability rows, and CVE IDs client-side, then lets the analyst launch CVE research against selected findings.
+SBOM uploads are parsed locally in the browser session. The current SBOM workflow does not send uploaded files to the backend, S3, Lambda, or any third-party source. The app extracts components, package URLs, CPEs, embedded vulnerability rows, and CVE IDs client-side, then lets the analyst click a CVE to view affected package rows or launch CVE research against selected findings.
 
 ## Production AWS Deployment
 
