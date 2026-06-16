@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VulnScope</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Case workspace">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">VS</div>
+          <div>
+            <p class="eyebrow">CVE Intelligence</p>
+            <h1>VulnScope</h1>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <label class="field-label" for="caseFilter">Saved cases</label>
+          <input id="caseFilter" class="input" type="search" placeholder="Filter case files">
+          <div id="caseList" class="case-list" aria-live="polite"></div>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="section-heading">
+            <h2>Watchlist</h2>
+            <button id="watchRefreshAll" class="icon-button" type="button" title="Refresh watchlist" aria-label="Refresh watchlist">W</button>
+          </div>
+          <div id="watchList" class="case-list" aria-live="polite"></div>
+        </div>
+
+        <div class="sidebar-section source-panel">
+          <div class="section-heading">
+            <h2>Source Health</h2>
+            <button id="healthRefresh" class="icon-button" type="button" title="Refresh source health" aria-label="Refresh source health">R</button>
+          </div>
+          <div id="sourceHealth" class="source-list"></div>
+        </div>
+
+        <div class="sidebar-section">
+          <button id="clearLocalData" class="danger-button sidebar-danger" type="button">Clear local data</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <form id="searchForm" class="search-form" novalidate>
+            <label class="sr-only" for="cveInput">CVE ID</label>
+            <div class="search-field">
+              <input id="cveInput" class="search-input" name="cve" autocomplete="off" spellcheck="false" placeholder="CVE-2023-22527" aria-describedby="searchHelp searchError" aria-invalid="false" required>
+              <div id="searchHelp" class="field-hint">Use CVE-YYYY-NNNN format, for example CVE-2023-22527.</div>
+              <div id="searchError" class="field-error" role="alert" hidden></div>
+            </div>
+            <button id="researchButton" class="primary-button" type="submit">Research CVE</button>
+          </form>
+          <div class="quick-actions" aria-label="Example CVEs">
+            <button class="ghost-button example-cve" type="button" data-cve="CVE-2023-22527">Confluence RCE</button>
+            <button class="ghost-button example-cve" type="button" data-cve="CVE-2021-44228">Log4Shell</button>
+            <button class="ghost-button example-cve" type="button" data-cve="CVE-2024-3094">XZ Utils</button>
+          </div>
+        </header>
+
+        <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+        <section id="content" class="content" aria-live="polite" tabindex="-1"></section>
+      </main>
+    </div>
+
+    <template id="emptyTemplate">
+      <div class="empty-state">
+        <div class="empty-panel">
+          <p class="eyebrow">Ready</p>
+          <h2>Paste a CVE to generate an evidence-backed triage brief.</h2>
+          <p>VulnScope will query public vulnerability sources, synthesize risk signals, collect references, and keep the work in a local case file.</p>
+        </div>
+      </div>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

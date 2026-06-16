@@ -1,0 +1,16 @@
+{
+  "name": "vulnscope",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs",
+    "check:client": "node --check public/app.js",
+    "test": "node scripts/security-smoke.mjs",
+    "verify": "npm run check && npm run check:client && npm test && npm audit --omit=dev"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
