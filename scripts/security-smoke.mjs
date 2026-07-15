@@ -1,6 +1,15 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
+import { buildOsvQuery } from "../server.mjs";
+
+const versionedPurlQuery = buildOsvQuery({
+  purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+  version: "2.14.1"
+});
+assert(!Object.hasOwn(versionedPurlQuery, "version"), "versioned PURLs must not duplicate the OSV version field");
+const unversionedPurlQuery = buildOsvQuery({ purl: "pkg:maven/org.example/library", version: "1.2.3" });
+assert(unversionedPurlQuery.version === "1.2.3", "unversioned PURLs should retain an explicit OSV version");
 
 let child;
 const rootUrl = await startTestServer();

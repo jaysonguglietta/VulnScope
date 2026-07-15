@@ -1284,19 +1284,7 @@ async function enrichPackages(packages) {
 }
 
 async function fetchOsvPackageMatches(packages) {
-  const queries = packages.map((pkg) => {
-    if (pkg.purl) return {
-      ...(pkg.version ? { version: pkg.version } : {}),
-      package: { purl: pkg.purl }
-    };
-    return {
-      version: pkg.version,
-      package: {
-        ecosystem: pkg.ecosystem,
-        name: pkg.name
-      }
-    };
-  });
+  const queries = packages.map(buildOsvQuery);
   const batch = await fetchJson("https://api.osv.dev/v1/querybatch", {
     method: "POST",
     headers: {
@@ -1337,6 +1325,23 @@ async function fetchOsvPackageMatches(packages) {
     vulnerabilityCount: new Set(enriched.flatMap((pkg) => pkg.vulnerabilities.map((item) => item.id))).size,
     truncated: ids.length > selectedIds.length,
     message: `Matched ${ids.length} OSV record${ids.length === 1 ? "" : "s"} across ${packages.length} package${packages.length === 1 ? "" : "s"}.`
+  };
+}
+
+export function buildOsvQuery(pkg) {
+  if (pkg.purl) {
+    const purlIncludesVersion = /@[^/?#]+(?:[?#]|$)/.test(pkg.purl);
+    return {
+      ...(!purlIncludesVersion && pkg.version ? { version: pkg.version } : {}),
+      package: { purl: pkg.purl }
+    };
+  }
+  return {
+    version: pkg.version,
+    package: {
+      ecosystem: pkg.ecosystem,
+      name: pkg.name
+    }
   };
 }
 
