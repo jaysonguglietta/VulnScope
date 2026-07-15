@@ -1,26 +1,79 @@
 # VulnScope
 
-VulnScope is a local web application for CVE research and vulnerability triage. Paste a CVE ID and it collects public intelligence from NVD, CVE Services, FIRST EPSS, CISA KEV, GitHub, Hacker News, Reddit, and optional VulnCheck API data.
+VulnScope is a CVE research and exposure-triage console. Paste one CVE, research a batch, or load SBOM and cloud evidence to answer the questions that matter during remediation:
 
-It is designed to answer practical triage questions:
+- Is exploitation confirmed, plausible, or only being discussed?
+- Is exploit code public, and how credible is the evidence?
+- Which packages and imported cloud assets are exposed?
+- Do AWS or Azure advisories or customer-managed services intersect with the issue?
+- What should an engineer validate, patch, mitigate, and monitor?
 
-- Has this CVE been exploited?
-- Are researchers, developers, or attackers talking about it?
-- Is there public exploit code or exploit-related evidence?
-- What should I patch or validate?
-- Could AWS or Azure customer-managed services be affected?
-- Do my uploaded SBOM files reference affected components or known CVEs?
+Production: [https://vulnscope.jsontechnology.com](https://vulnscope.jsontechnology.com)
 
-## Run
+## Product Workflows
+
+### Deep CVE research
+
+- Validates CVE IDs and collects NVD, CVE Services, CISA KEV, FIRST EPSS, GitHub Advisory Database, GitHub code and discussion leads, Hacker News, Reddit, and optional VulnCheck intelligence.
+- Separates authoritative records, confirmed exploitation, public exploit leads, predictive risk, and public chatter.
+- Produces a real-world verdict, risk score, evidence timeline, affected-product signals, cloud exposure analysis, and source health.
+- Generates plain-text remediation, detection, cloud validation, ticket, executive, and risk-acceptance text with source links.
+- Saves cases and watchlist entries locally in the browser and exports Markdown or JSON briefs.
+
+### SBOM and package intelligence
+
+- Loads up to 10 SBOMs per batch and parses them in a background browser worker.
+- Supports CycloneDX JSON/XML, SPDX JSON/tag-value, Syft JSON, Grype JSON, and generic JSON/text containing CVEs.
+- Shows the exact package rows associated with an SBOM CVE and automatically checks loaded SBOMs for the CVE currently being researched.
+- Optionally enriches package URLs and ecosystems against OSV after explicit confirmation, including aliases, affected ranges, and known fixed versions.
+- Preserves CycloneDX VEX analysis and applies VEX status to exposure prioritization.
+
+### Exposure workspace
+
+- Combines SBOM packages, OSV results, imported cloud findings, VEX statements, cases, watchlist entries, and bulk-research results.
+- Filters by CVE, package or asset, source, severity, workflow status, and VEX status.
+- Prioritizes confirmed exploitation, KEV membership, EPSS, CVSS, fix availability, and asset evidence while suppressing valid `not_affected` VEX statements.
+- Exports the normalized exposure queue as CSV and opens any row directly in the full CVE investigation.
+
+### Cloud and VEX evidence
+
+- Imports Amazon Inspector findings and generic AWS/Azure vulnerability JSON.
+- Imports Microsoft Defender-style CSV or JSON exports.
+- Imports OpenVEX, CSAF VEX, and CycloneDX VEX statements.
+- Lists affected assets, package or resource evidence, remediation details, and VEX justification without uploading the original files.
+
+### Bulk research and scheduled monitoring
+
+- Queues up to 25 CVEs for bounded, sequential bulk research and feeds completed results into the exposure workspace.
+- Supports an optional AWS scheduled monitor configured at deployment time.
+- The monitor stores 180-day snapshots in encrypted DynamoDB and sends SNS email only for material changes such as new KEV status, higher exploitation confidence, a meaningful EPSS jump, or new public code.
+
+## Privacy Boundary
+
+Raw SBOM, cloud finding, and VEX files are parsed locally and retained only in memory for the browser session. They are not uploaded to VulnScope, S3, Lambda, or a third party.
+
+OSV enrichment is a separate, explicit action. After confirmation, VulnScope sends only normalized package identifiers, ecosystems, and versions to the server, which queries OSV. Do not enrich package metadata that your policy treats as confidential.
+
+Case notes and watchlist entries are stored in browser local storage and pruned after 90 days. Authentication and request logging are intentionally excluded; do not treat this deployment as a shared confidential case-management system.
+
+## Run Locally
+
+Requires Node.js 20 or newer.
 
 ```bash
 npm ci
 npm start
 ```
 
-Open `http://127.0.0.1:5173`.
+Open `http://127.0.0.1:5173`. The server binds to localhost by default.
 
-By default the server binds to `127.0.0.1`. To expose it intentionally, set `HOST=0.0.0.0` and put it behind TLS, access control, and network restrictions.
+Optional source tokens improve coverage or rate limits:
+
+```bash
+NVD_API_KEY=... GITHUB_TOKEN=... VULNCHECK_API_TOKEN=... npm start
+```
+
+Use `.env.example` as a reference and do not commit real secrets.
 
 ## Verify
 
@@ -28,76 +81,40 @@ By default the server binds to `127.0.0.1`. To expose it intentionally, set `HOS
 npm run verify
 ```
 
-This runs server syntax checks, client syntax checks, offline security smoke tests, and `npm audit --omit=dev`.
+Verification includes server and browser-module syntax checks, API security smoke tests, SBOM/VEX/cloud/exposure parser tests, and a production-dependency audit.
 
-## Optional API Keys
+## Security Defaults
 
-The app works without keys, but these environment variables improve results or rate limits:
+- Security headers include CSP, HSTS in production, frame blocking, referrer policy, permissions policy, and content-sniffing protection.
+- Research and enrichment requests have per-client rate limits, bounded queues, request-body limits, upstream response limits, and allowlisted API methods.
+- AWS API Gateway throttles the stage to 2 requests per second with a burst of 5; API Lambda reserved concurrency is 2.
+- Client identity uses the trusted API Gateway source address. Arbitrary forwarded headers are not trusted from public clients.
+- Static and deployment-artifact buckets block public access and use server-side encryption; the static bucket also has versioning and lifecycle cleanup.
+- External links are limited to HTTP(S), rendered text is escaped, and uploaded evidence is parsed as data rather than injected into markup.
+- Source health reports observed success, failure, optional-token, or not-yet-checked state instead of implying every source is available.
 
-```bash
-NVD_API_KEY=... GITHUB_TOKEN=... VULNCHECK_API_TOKEN=... npm start
-```
+The built-in controls reduce abuse; they do not replace authentication or authorization. Keep the public site free of sensitive case notes and inventory data until identity and tenant controls are added.
 
-Keys are read only by the local server. They are not written into the frontend bundle.
+## AWS Deployment
 
-Use `.env.example` as a template and do not commit real `.env` files.
-
-## Hardening Defaults
-
-- Security headers are added to API and static responses, including CSP, frame blocking, referrer policy, and content sniffing protection.
-- Research requests are rate limited per client address. Defaults: `RATE_LIMIT_MAX=30` requests per minute and `REFRESH_RATE_LIMIT_MAX=6` refreshes per minute.
-- Research work is queued with bounded concurrency. Defaults: `RESEARCH_CONCURRENCY=4`, `RESEARCH_QUEUE_MAX=20`, `OUTBOUND_CONCURRENCY=8`, and `OUTBOUND_QUEUE_MAX=50`.
-- Upstream JSON responses are capped at `RESPONSE_MAX_BYTES=8388608` bytes by default.
-- The in-memory CVE cache is capped at `CACHE_MAX_ENTRIES=300` with a 10 minute TTL.
-- Browser links from research sources are restricted to `http` and `https` URLs before rendering.
-- Saved cases and watchlist entries are pruned after 90 days in this browser.
-- SBOM files are parsed locally in the browser session and are not uploaded to the server.
-- Markdown and JSON exports warn before download because they can contain analyst notes and case metadata.
-- Evidence items include source reputation tiers so official records, predictive models, public code, exploit references, and chatter are separated.
-
-Authentication and request logging are intentionally not included yet. Do not expose this app to untrusted users without adding an identity and authorization layer.
-
-## Deployment
-
-Production is currently deployed at [https://vulnscope.jsontechnology.com](https://vulnscope.jsontechnology.com).
-
-The AWS deployment uses the lowest-maintenance serverless option for a low-traffic site:
-
-- Route 53 hosts `jsontechnology.com` DNS.
-- CloudFront serves TLS, security headers, and global edge delivery.
-- S3 privately stores the static frontend.
-- API Gateway HTTP API routes `/api/*` requests to Lambda.
-- Lambda runs the VulnScope research API only when requests arrive.
-- CloudWatch billing alarms send email alerts at estimated monthly charges of `$10` and `$20`.
-
-Deploy updates with:
+The low-traffic architecture uses Route 53, CloudFront, a private S3 static origin, API Gateway HTTP API, and on-demand Lambda. Existing CloudWatch estimated-charge alarms email `Jayson.Guglietta@gmail.com` at `$10` and `$20`.
 
 ```bash
 npm run deploy:aws
 ```
 
-See [docs/deployment.md](docs/deployment.md) for the live AWS resource inventory, Docker/private-hosting notes, TLS reverse proxy guidance, secret handling, and multi-instance rate limiting guidance.
+Enable scheduled CVE monitoring during deployment:
 
-## What It Does
+```bash
+NOTIFICATION_EMAIL=Jayson.Guglietta@gmail.com \
+MONITORED_CVES=CVE-2021-44228,CVE-2023-22527 \
+npm run deploy:aws
+```
 
-- Validates CVE IDs before research.
-- Fetches official CVE metadata, CVSS, affected products, weaknesses, and references.
-- Adds EPSS probability and CISA KEV exploitation status.
-- Searches GitHub repository leads for public proof-of-concept indicators.
-- Searches GitHub Issues/PRs, Hacker News, and Reddit for public chatter.
-- Produces a real-world verdict that separates confirmed exploitation, public exploit leads, and community discussion.
-- Estimates AWS and Azure exposure by separating official cloud advisory signals from possible customer-managed workload exposure.
-- Uploads one or more SBOM files and extracts components, package URLs, CPEs, vulnerability rows, and CVE IDs.
-- Supports CycloneDX JSON/XML, SPDX JSON/tag-value, Syft JSON, Grype vulnerability JSON, and generic CVE extraction from SBOM-like text.
-- Lets analysts click an SBOM CVE to see the exact affected package rows, copy SBOM CVE lists, export SBOM summaries, and research any SBOM CVE directly in VulnScope.
-- Automatically checks loaded SBOMs for the exact CVE being researched and surfaces matching packages in the CVE report.
-- Compares loaded SBOM components against a researched CVE's affected product signals in the Impact tab.
-- Builds a risk score, evidence list, remediation checklist, and timeline.
-- Generates copy-ready remediation, detection, cloud impact, ticket, executive, and risk acceptance text.
-- Saves case notes, owner, status, and tags in browser local storage.
-- Watches CVEs for changes across risk, exploitation, evidence, chatter, cloud service candidates, and reference counts.
-- Exports Markdown and JSON briefs.
+AWS sends an SNS subscription-confirmation email the first time monitoring is enabled. Monitoring remains disabled when either the email or CVE list is empty.
 
-## Limits
+See [docs/deployment.md](docs/deployment.md) for the resource inventory, route and quota details, validation commands, Docker and reverse-proxy guidance, and monitor operations. See [SECURITY.md](SECURITY.md) for the deployment boundary and reporting process.
 
-This is a research and triage console, not a scanner. GitHub matches, public chatter, exploit references, and cloud service candidates are leads, not proof of exploitability in your environment. Validate with asset inventory, cloud inventory, vendor advisories, scanner coverage, and telemetry before making remediation decisions.
+## Limitations
+
+VulnScope is a research and prioritization console, not an authenticated scanner or proof of exploitability. Search matches, public chatter, inferred cloud services, imported findings, and package-version ranges can be incomplete or wrong. Confirm decisions against vendor advisories, authoritative inventory, scanner evidence, compensating controls, and production telemetry.

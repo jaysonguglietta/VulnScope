@@ -1,30 +1,30 @@
 # VulnScope Deployment Notes
 
-VulnScope is hardened for local use by default. It binds to `127.0.0.1`, keeps source tokens server-side, adds security headers, rate limits research requests, caps upstream responses, and stores case notes in browser local storage.
+Production: `https://vulnscope.jsontechnology.com`
 
-Authentication and request logging are intentionally not included yet.
+VulnScope uses a serverless AWS deployment for very light traffic. Authentication and request logging are intentionally excluded. The production boundary is public research with browser-local, non-sensitive analyst data.
 
-SBOM uploads are parsed locally in the browser session. The current SBOM workflow does not send uploaded files to the backend, S3, Lambda, or any third-party source. The app extracts components, package URLs, CPEs, embedded vulnerability rows, and CVE IDs client-side. The SBOM workspace lists all CVEs found in uploaded files, while a researched CVE automatically checks loaded SBOMs for an exact CVE match and surfaces affected package rows when available.
-
-## Production AWS Deployment
-
-Live site: `https://vulnscope.jsontechnology.com`
-
-This deployment uses a cheap serverless architecture because the site is expected to receive only a few hits per day. Static files are served from S3 through CloudFront, and the research API runs on Lambda behind API Gateway only when a request arrives.
-
-Request path:
+## Architecture
 
 ```text
-User browser
-  -> Route 53 vulnscope.jsontechnology.com
-  -> CloudFront distribution
-  -> S3 private static bucket for /, /app.js, /styles.css
-  -> API Gateway HTTP API for /api/*
-  -> Lambda vulnscope-api
-  -> Public CVE intelligence sources
+Browser
+  -> Route 53: vulnscope.jsontechnology.com
+  -> CloudFront: TLS, security headers, method controls
+     -> private S3 origin: HTML, CSS, JavaScript, browser worker
+     -> API Gateway HTTP API
+        -> vulnscope-api Lambda
+           -> public vulnerability-intelligence sources
+
+Optional EventBridge schedule
+  -> vulnscope-monitor Lambda
+     -> public vulnerability-intelligence sources
+     -> encrypted DynamoDB snapshots with 180-day TTL
+     -> SNS email for material changes
 ```
 
-Current AWS resource inventory:
+Raw SBOM, cloud, and VEX files remain in browser memory. The backend receives a CVE ID for research or, after explicit confirmation, a bounded set of normalized package identifiers for OSV enrichment.
+
+## Resource Inventory
 
 - AWS account: `171058045575`
 - Region: `us-east-1`
@@ -34,96 +34,168 @@ Current AWS resource inventory:
 - CloudFront distribution: `E19BTXYV3YQQSQ`
 - CloudFront domain: `d306xsajqlo259.cloudfront.net`
 - API Gateway endpoint: `https://0itdu9uhqc.execute-api.us-east-1.amazonaws.com`
-- Lambda function: `vulnscope-api`
+- API Lambda: `vulnscope-api`
 - Static bucket: `vulnscope-jsontechnology-com-171058045575`
 - Artifact bucket: `vulnscope-artifacts-171058045575-us-east-1`
 - ACM certificate: `arn:aws:acm:us-east-1:171058045575:certificate/41e49f5a-74e5-4901-ba91-f81a998a2183`
 - Billing SNS topic: `arn:aws:sns:us-east-1:171058045575:vulnscope-cost-alerts`
-- Billing alerts: `VulnScope-Monthly-EstimatedCharges-10USD` and `VulnScope-Monthly-EstimatedCharges-20USD`
+- Billing alarms: `VulnScope-Monthly-EstimatedCharges-10USD` and `VulnScope-Monthly-EstimatedCharges-20USD`
 
-Cost alert emails are configured for `Jayson.Guglietta@gmail.com`. AWS sends billing metrics from `us-east-1`, so the alarms are also in `us-east-1`.
+Estimated-charge alarms send to `Jayson.Guglietta@gmail.com`. Billing metrics and alarms are in `us-east-1`.
 
-## AWS Deploy Command
+Scheduled-monitor resources are conditional. When enabled, the stack adds `vulnscope-monitor`, an EventBridge rule, an encrypted on-demand DynamoDB table, and a dedicated SNS topic/subscription. Read their generated identifiers from CloudFormation outputs and resources rather than assuming fixed ARNs.
 
-Deploy from the repository root:
+## Deploy
+
+From the repository root:
 
 ```bash
+npm run verify
 npm run deploy:aws
 ```
 
-The deploy script:
-
-- Looks up the AWS account and Route 53 hosted zone.
-- Creates or reuses the private deployment artifact bucket.
-- Packages `server.mjs`, `lambda.mjs`, and `package.json` into a Lambda zip under `.deploy/`.
-- Uploads the Lambda zip to S3.
-- Deploys `infra/vulnscope.yml` with CloudFormation.
-- Syncs `public/` to the private static S3 bucket.
-- Creates a CloudFront invalidation.
-
-The default deployment variables are:
+Defaults:
 
 ```bash
 AWS_REGION=us-east-1
+AWS_PROFILE=json
+EXPECTED_AWS_ACCOUNT_ID=171058045575
 STACK_NAME=vulnscope-prod
 DOMAIN_NAME=vulnscope.jsontechnology.com
 ROOT_DOMAIN=jsontechnology.com
 ```
 
-Override them only when intentionally deploying another environment:
+The script refuses to deploy when the resolved account differs from `EXPECTED_AWS_ACCOUNT_ID`. This prevents an accidentally selected AWS profile from creating the production names in another account.
+
+The script:
+
+1. Resolves the AWS account and public Route 53 hosted zone.
+2. Creates or reuses the private artifact bucket and enforces AES-256 server-side encryption.
+3. Packages `server.mjs`, `lambda.mjs`, `monitor.mjs`, production dependencies, and lock files.
+4. Uploads the immutable Lambda artifact and deploys `infra/vulnscope.yml`.
+5. Syncs `public/` to the private static bucket and invalidates CloudFront.
+
+Deploy another environment only with intentional overrides:
 
 ```bash
-STACK_NAME=vulnscope-dev DOMAIN_NAME=vulnscope-dev.jsontechnology.com npm run deploy:aws
+STACK_NAME=vulnscope-dev \
+DOMAIN_NAME=vulnscope-dev.jsontechnology.com \
+npm run deploy:aws
 ```
 
-## AWS Validation
+For another AWS account, also set that account's profile and expected account ID explicitly.
 
-After deployment, validate the static site and API:
+## Scheduled Monitoring
+
+Monitoring is disabled unless both `NOTIFICATION_EMAIL` and `MONITORED_CVES` are non-empty.
+
+```bash
+NOTIFICATION_EMAIL=Jayson.Guglietta@gmail.com \
+MONITORED_CVES=CVE-2021-44228,CVE-2023-22527 \
+MONITOR_SCHEDULE='rate(1 day)' \
+npm run deploy:aws
+```
+
+Confirm the SNS subscription email after the first deployment. The initial execution creates baselines and does not alert. Later executions alert only on material changes, including:
+
+- New CISA KEV membership
+- Changed risk, real-world, exploitation, exploit-maturity, or patch status
+- EPSS increase of at least 0.10
+- Increased public exploit-code evidence
+- At least three new evidence items
+
+Snapshots expire after 180 days. Update the CVE list by redeploying with the complete desired comma-separated list. Disable monitoring by deploying with empty `NOTIFICATION_EMAIL` and `MONITORED_CVES`; CloudFormation removes the conditional resources.
+
+The browser watchlist is intentionally local and is not synchronized to the scheduled monitor because the application has no authenticated user account or server-side case store.
+
+## API Contract and Limits
+
+Production exposes only:
+
+- `GET /api/health`
+- `GET /api/research?cve=CVE-YYYY-NNNN[&refresh=1]`
+- `POST /api/enrich`
+
+The enrichment request is JSON and accepts no more than 200 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 120 per request, and upstream responses are capped at 8 MiB.
+
+API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
+
+Lambda uses API Gateway's `requestContext.http.sourceIp` as its trusted rate-limit identity. For a local reverse-proxy deployment, forwarded addresses are accepted only when `TRUST_PROXY=1` and the direct peer is loopback.
+
+## Storage and Retention
+
+- Static bucket: private OAC access, AES-256 encryption, versioning, noncurrent versions deleted after 7 days.
+- Artifact bucket: public access blocked, AES-256 encryption enforced by the deploy script.
+- Browser uploads: memory only; cleared on refresh or by the user.
+- Browser cases and watchlist: local storage; pruned after 90 days.
+- Monitor snapshots: encrypted DynamoDB; TTL after 180 days.
+
+## Production Validation
 
 ```bash
 curl -I https://vulnscope.jsontechnology.com/
 curl -sS https://vulnscope.jsontechnology.com/api/health
-curl -sS "https://vulnscope.jsontechnology.com/api/research?cve=CVE-2023-22527"
+curl -sS 'https://vulnscope.jsontechnology.com/api/research?cve=CVE-2023-22527'
+curl -i -X POST https://vulnscope.jsontechnology.com/api/research
 ```
 
-The deployed site should return CloudFront security headers, including Content Security Policy, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, Referrer Policy, Permissions Policy, and HSTS.
+Expected behavior:
 
-## Cheapest AWS Option Chosen
+- Static content returns CSP, HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, Referrer Policy, and Permissions Policy.
+- Health reports source states truthfully as observed, optional, or not yet checked.
+- Valid research returns JSON; invalid CVE IDs return `400`.
+- A method not present in API Gateway returns `404`, while the local API handler returns `405` for a known route with a disallowed method.
 
-For a few hits per day, the chosen AWS path is normally cheaper and easier to operate than a continuously running EC2 instance, ECS service, or container host:
+Validate infrastructure before deployment:
 
-- S3 charges only for static storage and requests.
-- CloudFront has very low cost for small traffic volumes.
-- API Gateway HTTP API is less expensive than REST API for this use case.
-- Lambda charges only when the API is invoked and avoids an always-on server.
-- ACM public certificates are free for CloudFront.
-- Route 53 hosted zone cost already exists for `jsontechnology.com`; the added record cost is negligible.
+```bash
+aws cloudformation validate-template \
+  --region us-east-1 \
+  --template-body file://infra/vulnscope.yml
+```
 
-Expected baseline cost should stay low for light use, but billing alerts are configured at `$10` and `$20` so unexpected traffic or AWS resource drift is visible quickly.
+## Cost Model
 
-## Cloud Source Tokens
+For a few requests per day, this avoids continuously running compute:
 
-The public deployment currently runs without optional source API tokens. VulnScope still researches CVEs through unauthenticated public sources, but optional tokens can improve rate limits and source coverage:
+- S3 and CloudFront charge for small storage and request volume.
+- HTTP API and Lambda charge per request/invocation.
+- ACM public certificates have no separate certificate charge.
+- Conditional DynamoDB, EventBridge, SNS, and monitor Lambda usage should remain small for a short CVE list and daily schedule.
+
+The `$10` and `$20` alarms are account-level estimated-charge alarms, not hard spending limits. Unexpected traffic can accrue charges before an email is read. AWS WAF is intentionally omitted to preserve the low baseline cost; API Gateway throttling, Lambda concurrency, and application limits are the current abuse-cost controls.
+
+## Source Tokens
+
+The production stack works without optional tokens. These improve source coverage or rate limits:
 
 - `NVD_API_KEY`
 - `GITHUB_TOKEN`
 - `VULNCHECK_API_TOKEN`
 
-Do not commit these values. If the production deployment needs them, prefer AWS Secrets Manager or encrypted Lambda environment variables with tightly scoped IAM access. Avoid storing long-lived personal tokens directly in CloudFormation parameters.
+Never commit them or add them to frontend files. For production, use Secrets Manager or another approved secret-injection path and tightly scoped IAM. The current template does not provision those secrets.
 
-## SBOM Upload Handling
+## Evidence Inputs
 
 Supported SBOM inputs:
 
-- CycloneDX JSON and XML
-- SPDX JSON and tag-value
+- CycloneDX JSON/XML
+- SPDX JSON/tag-value
 - Syft JSON
 - Grype vulnerability JSON
-- Generic text or JSON files with embedded CVE IDs
+- Generic JSON/text with CVE IDs
 
-Current limits are browser-side safety controls: up to 10 files per upload batch, 10 MB per file, and 40 MB total per batch. SBOM reports are kept only in memory for the current browser session and can be cleared from the sidebar. They are not persisted to local storage.
+Supported cloud and VEX inputs:
 
-## Local Run
+- Amazon Inspector and generic AWS/Azure finding JSON
+- Microsoft Defender-style CSV/JSON
+- OpenVEX
+- CSAF VEX
+- CycloneDX VEX
+
+Browser safety limits are 10 files per batch, 10 MiB per file, 40 MiB total, and 100,000 normalized parser records. JSON and text parsing runs in a Web Worker; XML uses the browser DOM parser fallback.
+
+## Local and Container Runs
 
 ```bash
 npm ci
@@ -132,44 +204,16 @@ npm start
 
 Open `http://127.0.0.1:5173`.
 
-## Environment Variables
-
-Start from `.env.example` and keep real secrets out of Git:
-
-```bash
-cp .env.example .env
-```
-
-Important settings:
-
-- `HOST`: defaults to `127.0.0.1`. Use `0.0.0.0` only behind trusted network controls.
-- `NVD_API_KEY`, `GITHUB_TOKEN`, `VULNCHECK_API_TOKEN`: optional source tokens.
-- `TRUST_PROXY=1`: use only when a trusted reverse proxy controls `X-Forwarded-For`.
-- `RATE_LIMIT_MAX`, `REFRESH_RATE_LIMIT_MAX`: per-client abuse limits.
-- `RESEARCH_CONCURRENCY`, `OUTBOUND_CONCURRENCY`: server-side work limits.
-- `RESPONSE_MAX_BYTES`: max upstream JSON response size.
-
-## Docker
-
-Build:
-
 ```bash
 docker build -t vulnscope .
-```
-
-Run local-only:
-
-```bash
 docker run --rm -p 127.0.0.1:5173:5173 --env-file .env -e HOST=0.0.0.0 vulnscope
 ```
 
-The image runs as the non-root `node` user and does not require write access to the application directory.
+The image runs as the non-root `node` user.
 
-## TLS Reverse Proxy
+## Reverse Proxy
 
-For a single-user private deployment, terminate HTTPS at a reverse proxy and keep VulnScope bound to localhost or a private container network.
-
-Nginx example:
+Keep the app on localhost or a private container network and terminate TLS at the proxy. When Nginx is the only network path to VulnScope:
 
 ```nginx
 limit_req_zone $binary_remote_addr zone=vulnscope_api:10m rate=30r/m;
@@ -181,7 +225,7 @@ server {
   ssl_certificate /etc/letsencrypt/live/vulnscope/fullchain.pem;
   ssl_certificate_key /etc/letsencrypt/live/vulnscope/privkey.pem;
 
-  location /api/research {
+  location /api/ {
     limit_req zone=vulnscope_api burst=10 nodelay;
     proxy_pass http://127.0.0.1:5173;
     proxy_set_header Host $host;
@@ -192,25 +236,12 @@ server {
   location / {
     proxy_pass http://127.0.0.1:5173;
     proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto https;
   }
 }
 ```
 
-Set `TRUST_PROXY=1` only when the proxy is the only path to the app.
+Set `TRUST_PROXY=1` only when the direct peer is loopback and that proxy exclusively controls `X-Forwarded-For`. For multiple application instances, enforce shared rate limiting at the ingress, WAF, or another centralized control; in-memory limits are process-local.
 
-## Distributed Rate Limiting
+## Known Boundary
 
-The built-in rate limiter is in-memory and protects a single VulnScope process. For multiple app instances, use a shared enforcement point:
-
-- Nginx `limit_req_zone` at the reverse proxy.
-- Cloudflare/WAF rate limiting in front of the app.
-- Kubernetes ingress rate limiting.
-- A future Redis-backed limiter if the app needs native multi-instance enforcement.
-
-Do not rely on per-process limits alone when running more than one instance.
-
-## Server-Side Case Storage
-
-Server-side case storage is intentionally not enabled without authentication. Browser-local case storage avoids creating a shared unauthenticated case database. If this becomes a team tool, add identity first, then store cases server-side with per-user or per-team authorization and retention controls.
+Server-side case, SBOM, inventory, and browser-watchlist storage remain disabled until authentication and authorization exist. This prevents an unauthenticated shared data store from becoming an exposure or cross-user access problem.

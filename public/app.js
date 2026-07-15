@@ -1,3 +1,5 @@
+import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "./modules/workspace.js";
+
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
 const STORAGE_RETENTION_MS = STORAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -10,16 +12,28 @@ const SBOM_CVE_DISPLAY_LIMIT = 150;
 
 const state = {
   current: null,
+  view: "empty",
   activeTab: "overview",
   evidenceFilter: "all",
   evidenceSort: "priority",
   cases: loadCases(),
   watchlist: loadWatchlist(),
   sbomReports: [],
+  evidenceReports: [],
+  enrichmentReports: [],
   activeSbomId: null,
   activeSbomCveId: null,
+  activeEvidenceId: null,
   assetInput: "",
   caseFilter: "",
+  exposureFilter: "",
+  exposurePriority: "all",
+  exposureStatus: "all",
+  exposureProvider: "all",
+  bulkInput: "",
+  bulkQueue: [],
+  bulkRunning: false,
+  enriching: false,
   sourceHealth: [],
   loading: false
 };
@@ -40,6 +54,8 @@ const elements = {
   sbomInput: document.querySelector("#sbomInput"),
   sbomList: document.querySelector("#sbomList"),
   sbomClear: document.querySelector("#sbomClear"),
+  evidenceInput: document.querySelector("#evidenceInput"),
+  evidenceList: document.querySelector("#evidenceList"),
   clearLocalData: document.querySelector("#clearLocalData"),
   emptyTemplate: document.querySelector("#emptyTemplate")
 };
@@ -82,6 +98,10 @@ elements.sbomInput?.addEventListener("change", async () => {
   elements.sbomInput.value = "";
 });
 elements.sbomClear?.addEventListener("click", clearSboms);
+elements.evidenceInput?.addEventListener("change", async () => {
+  await handleEvidenceFiles([...elements.evidenceInput.files]);
+  elements.evidenceInput.value = "";
+});
 
 document.addEventListener("click", (event) => {
   const action = event.target.closest("[data-action]");
@@ -113,6 +133,39 @@ document.addEventListener("click", (event) => {
       break;
     case "open-sbom-cve-report":
       openSbomCveReport(action.dataset.reportId, action.dataset.cve);
+      break;
+    case "open-exposures":
+      openExposureWorkspace();
+      break;
+    case "open-bulk":
+      openBulkWorkspace();
+      break;
+    case "open-evidence":
+      openEvidenceReport(value);
+      break;
+    case "clear-evidence":
+      clearEvidenceReports();
+      break;
+    case "enrich-sbom":
+      enrichActiveSbom();
+      break;
+    case "export-exposures":
+      exportExposureCsv();
+      break;
+    case "research-exposure":
+      research(value);
+      break;
+    case "run-bulk":
+      runBulkResearch();
+      break;
+    case "open-bulk-result":
+      openBulkResult(value);
+      break;
+    case "clear-bulk":
+      clearBulkResearch();
+      break;
+    case "copy-monitor-config":
+      copyMonitorConfiguration();
       break;
     case "refresh-watch":
       refreshWatch(value);
@@ -179,11 +232,38 @@ document.addEventListener("change", (event) => {
     state.evidenceSort = event.target.value;
     render();
   }
+  if (event.target.matches("#exposurePriority")) {
+    state.exposurePriority = event.target.value;
+    renderExposureWorkspace();
+  }
+  if (event.target.matches("#exposureStatus")) {
+    state.exposureStatus = event.target.value;
+    renderExposureWorkspace();
+  }
+  if (event.target.matches("#exposureProvider")) {
+    state.exposureProvider = event.target.value;
+    renderExposureWorkspace();
+  }
 });
 
 document.addEventListener("input", (event) => {
   if (event.target.matches("#assetInput")) {
     state.assetInput = event.target.value;
+    return;
+  }
+  if (event.target.matches("#exposureFilter")) {
+    state.exposureFilter = event.target.value.trim().toLowerCase();
+    renderExposureWorkspace();
+    requestAnimationFrame(() => {
+      const input = document.querySelector("#exposureFilter");
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+    return;
+  }
+  if (event.target.matches("#bulkCves")) {
+    state.bulkInput = event.target.value;
     return;
   }
   if (!state.current) return;
@@ -198,12 +278,19 @@ refreshHealth();
 renderCases();
 renderWatchlist();
 renderSbomList();
+renderEvidenceList();
 renderEmpty();
+const initialCve = normalizeCve(new URLSearchParams(globalThis.location?.search || "").get("cve"));
+if (initialCve) {
+  elements.input.value = initialCve;
+  research(initialCve);
+}
 
 async function research(cve, options = {}) {
   const normalized = normalizeCve(cve);
   if (!normalized) return;
   state.loading = true;
+  state.view = "investigation";
   state.current = null;
   state.activeSbomId = null;
   state.activeSbomCveId = null;
@@ -222,7 +309,7 @@ async function research(cve, options = {}) {
       throw new Error(payload.message || "Research failed.");
     }
     state.current = attachCaseDraft(normalizeInvestigationPayload(payload));
-    state.sourceHealth = payload.sourceResults || state.sourceHealth;
+    mergeSourceHealth(payload.sourceResults);
     showToast(payload.cached ? "Loaded cached research." : "Research complete.");
     render();
     focusContent();
@@ -245,8 +332,10 @@ async function refreshHealth() {
     state.sourceHealth = (payload.sources || []).map((source) => ({
       id: source.id,
       label: source.label,
-      status: "ok",
-      message: source.optional ? "Optional source" : "Ready"
+      status: source.status || (source.optional ? "optional" : "unknown"),
+      message: source.message || (source.optional ? "Optional source" : "No live check yet"),
+      latencyMs: source.latencyMs ?? null,
+      lastCheckedAt: source.lastCheckedAt || null
     }));
     renderHealth();
   } catch {
@@ -329,6 +418,7 @@ function openCase(id) {
   const record = state.cases.find((item) => item.id === id);
   if (!record) return;
   state.current = attachCaseDraft(record.investigation);
+  state.view = "investigation";
   state.activeSbomId = null;
   state.activeSbomCveId = null;
   state.activeTab = "overview";
@@ -367,6 +457,7 @@ function openWatch(id) {
   const record = state.watchlist.find((item) => item.id === id);
   if (!record) return;
   state.current = attachCaseDraft(record.investigation);
+  state.view = "investigation";
   state.activeSbomId = null;
   state.activeSbomCveId = null;
   state.activeTab = "watchlist";
@@ -455,14 +546,21 @@ async function handleSbomFiles(files) {
     warnings.push(`Only the first ${SBOM_MAX_FILES} files were processed.`);
   }
 
-  const parsed = [];
+  const readable = [];
   for (const file of accepted) {
     try {
-      const text = await file.text();
-      parsed.push(parseSbomFile(file, text));
+      readable.push({ file, text: await file.text() });
     } catch (error) {
       warnings.push(`${file.name} could not be read: ${error.message || "browser file read failed"}.`);
     }
+  }
+
+  const parsed = [];
+  const backgroundResults = await parseSbomsInBackground(readable);
+  for (const item of readable) {
+    const result = backgroundResults?.find((entry) => entry.fileName === item.file.name);
+    if (result?.handled && result.parsed) parsed.push(result.parsed);
+    else parsed.push(parseSbomFile(item.file, item.text));
   }
 
   if (!parsed.length) {
@@ -476,6 +574,7 @@ async function handleSbomFiles(files) {
   state.activeSbomId = report.id;
   state.activeSbomCveId = currentCveMatch ? currentInvestigation.id : report.cves[0]?.id || null;
   state.current = currentInvestigation || null;
+  state.view = currentInvestigation ? "investigation" : "sbom";
   renderCases();
   renderSbomList();
   render();
@@ -483,10 +582,37 @@ async function handleSbomFiles(files) {
   showToast(currentCveMatch ? `${currentInvestigation.id} found in the uploaded SBOM.` : `Parsed ${report.files.length} SBOM file${report.files.length === 1 ? "" : "s"} with ${report.cves.length} CVE finding${report.cves.length === 1 ? "" : "s"}.`);
 }
 
+async function parseSbomsInBackground(files) {
+  if (!files.length || typeof Worker === "undefined") return null;
+  const id = globalThis.crypto?.randomUUID?.() || `sbom-${Date.now()}`;
+  const worker = new Worker("/sbom-worker.js", { type: "module" });
+  try {
+    return await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(null), 30000);
+      worker.addEventListener("message", (event) => {
+        if (event.data?.id !== id) return;
+        clearTimeout(timeout);
+        resolve(event.data.ok ? event.data.results : null);
+      }, { once: true });
+      worker.addEventListener("error", () => {
+        clearTimeout(timeout);
+        resolve(null);
+      }, { once: true });
+      worker.postMessage({
+        id,
+        files: files.map(({ file, text }) => ({ name: file.name, size: file.size, text }))
+      });
+    });
+  } finally {
+    worker.terminate();
+  }
+}
+
 function openSbom(id) {
   const report = state.sbomReports.find((item) => item.id === id);
   if (!report) return;
   state.activeSbomId = id;
+  state.view = "sbom";
   state.activeSbomCveId = report.cves.some((entry) => entry.id === state.activeSbomCveId) ? state.activeSbomCveId : report.cves[0]?.id || null;
   state.current = null;
   elements.input.value = "";
@@ -501,12 +627,445 @@ function clearSboms() {
     return;
   }
   state.sbomReports = [];
+  state.enrichmentReports = [];
   state.activeSbomId = null;
   state.activeSbomCveId = null;
   renderCases();
   renderSbomList();
   render();
   showToast("SBOM uploads cleared from this browser session.");
+}
+
+async function handleEvidenceFiles(files) {
+  if (!files.length) return;
+  const warnings = [];
+  const reports = [];
+  let totalBytes = 0;
+  for (const file of files.slice(0, SBOM_MAX_FILES)) {
+    if (file.size > SBOM_MAX_FILE_BYTES) {
+      warnings.push(`${file.name} was skipped because it is larger than ${formatBytes(SBOM_MAX_FILE_BYTES)}.`);
+      continue;
+    }
+    if (totalBytes + file.size > SBOM_MAX_TOTAL_BYTES) {
+      warnings.push(`${file.name} was skipped because the selected evidence batch is larger than ${formatBytes(SBOM_MAX_TOTAL_BYTES)}.`);
+      continue;
+    }
+    totalBytes += file.size;
+    try {
+      reports.push(parseEvidenceFile(file, await file.text()));
+    } catch (error) {
+      warnings.push(`${file.name} could not be imported: ${error.message || "browser file read failed"}.`);
+    }
+  }
+  if (files.length > SBOM_MAX_FILES) warnings.push(`Only the first ${SBOM_MAX_FILES} evidence files were processed.`);
+  if (!reports.length) {
+    showToast(warnings[0] || "No evidence files were imported.");
+    return;
+  }
+  if (warnings.length) reports[0].warnings = [...warnings, ...(reports[0].warnings || [])];
+  state.evidenceReports = [...reports, ...state.evidenceReports].slice(0, 12);
+  state.activeEvidenceId = reports[0].id;
+  state.view = "evidence";
+  state.current = null;
+  state.activeSbomId = null;
+  elements.input.value = "";
+  renderEvidenceList();
+  render();
+  focusContent();
+  const findingCount = reports.reduce((count, report) => count + report.findings.length, 0);
+  const vexCount = reports.reduce((count, report) => count + report.vexStatements.length, 0);
+  showToast(`Imported ${reports.length} evidence file${reports.length === 1 ? "" : "s"}: ${findingCount} findings and ${vexCount} VEX statements.`);
+}
+
+function openEvidenceReport(id) {
+  if (!state.evidenceReports.some((report) => report.id === id)) return;
+  state.activeEvidenceId = id;
+  state.view = "evidence";
+  state.current = null;
+  state.activeSbomId = null;
+  elements.input.value = "";
+  render();
+  renderEvidenceList();
+}
+
+function clearEvidenceReports() {
+  if (!state.evidenceReports.length) {
+    showToast("No imported evidence to clear.");
+    return;
+  }
+  if (!window.confirm("Clear imported cloud and VEX evidence from this browser session?")) return;
+  state.evidenceReports = [];
+  state.activeEvidenceId = null;
+  renderEvidenceList();
+  if (state.view === "evidence" || state.view === "exposures") openExposureWorkspace();
+  showToast("Imported evidence cleared.");
+}
+
+function renderEvidenceList() {
+  if (!elements.evidenceList) return;
+  if (!state.evidenceReports.length) {
+    elements.evidenceList.innerHTML = `<div class="empty-list">No cloud or VEX evidence loaded.</div>`;
+    return;
+  }
+  elements.evidenceList.innerHTML = `${state.evidenceReports.map((report) => `
+    <button class="case-card ${state.activeEvidenceId === report.id ? "active" : ""}" type="button" data-action="open-evidence" data-value="${escapeAttr(report.id)}">
+      <strong>${escapeHtml(report.fileName)}</strong>
+      <span>${escapeHtml(report.format)}</span>
+      <div class="case-meta">
+        <span>${report.findings.length} findings</span>
+        <span>${report.assets.length} assets</span>
+        <span>${report.vexStatements.length} VEX</span>
+      </div>
+    </button>
+  `).join("")}
+    <button class="sidebar-text-button" type="button" data-action="clear-evidence">Clear imported evidence</button>`;
+}
+
+async function enrichActiveSbom() {
+  const report = getActiveSbomReport();
+  if (!report) return;
+  const packages = report.components.map((component) => ({
+    purl: component.purl,
+    ecosystem: inferOsvEcosystem(component),
+    name: component.name,
+    version: component.version,
+    fileName: component.fileName
+  })).filter((pkg) => pkg.purl || (pkg.ecosystem && pkg.name && pkg.version)).slice(0, 200);
+  if (!packages.length) {
+    showToast("No package URLs or ecosystem package versions were available for online enrichment.");
+    return;
+  }
+  if (!window.confirm(`Online enrichment will send ${packages.length} package identifier${packages.length === 1 ? "" : "s"} to OSV. The SBOM file and unrelated metadata remain in this browser. Continue?`)) return;
+  state.enriching = true;
+  render();
+  try {
+    const response = await fetch("/api/enrich", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ packages })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || "Package enrichment failed.");
+    const enrichment = {
+      id: `enrichment-${report.id}`,
+      sbomId: report.id,
+      title: report.title,
+      ...payload
+    };
+    state.enrichmentReports = [enrichment, ...state.enrichmentReports.filter((item) => item.sbomId !== report.id)].slice(0, 12);
+    mergeSourceHealth(payload.sourceResults);
+    showToast(`Online enrichment found ${payload.vulnerabilityCount} vulnerability record${payload.vulnerabilityCount === 1 ? "" : "s"}.`);
+  } catch (error) {
+    showToast(error.message || "Package enrichment failed.");
+  } finally {
+    state.enriching = false;
+    render();
+  }
+}
+
+function inferOsvEcosystem(component) {
+  const type = String(component?.purl || "").match(/^pkg:([^/]+)\//i)?.[1]?.toLowerCase() || String(component?.type || "").toLowerCase();
+  return {
+    pypi: "PyPI",
+    npm: "npm",
+    maven: "Maven",
+    nuget: "NuGet",
+    cargo: "crates.io",
+    gem: "RubyGems",
+    golang: "Go",
+    composer: "Packagist",
+    pub: "Pub",
+    hex: "Hex"
+  }[type] || "";
+}
+
+function openExposureWorkspace() {
+  state.view = "exposures";
+  state.current = null;
+  state.activeSbomId = null;
+  state.activeEvidenceId = null;
+  elements.input.value = "";
+  render();
+  renderSbomList();
+  renderEvidenceList();
+}
+
+function getExposureRows() {
+  const investigations = [
+    ...state.cases.map((item) => item.investigation),
+    ...state.watchlist.map((item) => item.investigation),
+    ...state.bulkQueue.map((item) => item.investigation),
+    state.current
+  ].filter(Boolean);
+  return buildExposureRows({
+    sbomReports: state.sbomReports,
+    evidenceReports: state.evidenceReports,
+    enrichmentReports: state.enrichmentReports,
+    investigations
+  });
+}
+
+function filteredExposureRows() {
+  return getExposureRows().filter((row) => {
+    const text = [row.vulnerability, row.packageName, row.installedVersion, row.assetName, row.assetId, row.provider, row.source, row.vexStatus, row.owner].join(" ").toLowerCase();
+    if (state.exposureFilter && !text.includes(state.exposureFilter)) return false;
+    if (state.exposurePriority !== "all" && row.priority !== state.exposurePriority) return false;
+    if (state.exposureStatus !== "all" && row.vexStatus !== state.exposureStatus) return false;
+    if (state.exposureProvider !== "all" && row.provider !== state.exposureProvider) return false;
+    return true;
+  });
+}
+
+function renderExposureWorkspace() {
+  const allRows = getExposureRows();
+  const rows = filteredExposureRows();
+  const summary = summarizeExposureRows(allRows);
+  const providers = uniqueValues(allRows.map((row) => row.provider).filter(Boolean));
+  elements.content.innerHTML = `
+    <article class="investigation exposure-workspace">
+      <section class="brief-header">
+        <div class="brief-title">
+          <div class="badge-row">
+            <span class="badge">Exposure workspace</span>
+            <span class="badge">${summary.vulnerabilities} vulnerabilities</span>
+            <span class="badge">${summary.assets} assets</span>
+          </div>
+          <h2>Prioritized software exposure</h2>
+          <p>Consolidated SBOM, OSV, cloud finding, VEX, and saved investigation evidence. VEX statements affect prioritization but remain visible for auditability.</p>
+        </div>
+        <div class="header-actions">
+          <label class="secondary-button" for="sbomInput">Upload SBOM</label>
+          <label class="secondary-button" for="evidenceInput">Import evidence</label>
+          <button class="secondary-button" type="button" data-action="export-exposures" ${allRows.length ? "" : "disabled"}>Export CSV</button>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="Exposure metrics">
+        <div class="metric-card"><div class="metric-label">Exposure rows</div><div class="metric-value">${summary.total}</div><div class="metric-detail">Packages and assets</div></div>
+        <div class="metric-card"><div class="metric-label">Critical priority</div><div class="metric-value">${summary.critical}</div><div class="metric-detail">Active exposure records</div></div>
+        <div class="metric-card"><div class="metric-label">Known exploited</div><div class="metric-value">${summary.knownExploited}</div><div class="metric-detail">CISA KEV matches</div></div>
+        <div class="metric-card"><div class="metric-label">VEX resolved</div><div class="metric-value">${summary.notAffected + summary.fixed}</div><div class="metric-detail">Not affected or fixed</div></div>
+      </section>
+
+      <section class="panel">
+        <div class="exposure-filters">
+          <div>
+            <label class="field-label" for="exposureFilter">Search exposures</label>
+            <input id="exposureFilter" class="input" type="search" value="${escapeAttr(state.exposureFilter)}" placeholder="CVE, package, asset, owner">
+          </div>
+          <div>
+            <label class="field-label" for="exposurePriority">Priority</label>
+            <select id="exposurePriority" class="select">
+              ${selectOptions(["all", "Critical", "High", "Medium", "Low"], state.exposurePriority, "All priorities")}
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="exposureStatus">VEX status</label>
+            <select id="exposureStatus" class="select">
+              ${selectOptions(["all", "Affected", "Under investigation", "Not affected", "Fixed", "Unreviewed"], state.exposureStatus, "All VEX states")}
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="exposureProvider">Provider</label>
+            <select id="exposureProvider" class="select">
+              ${selectOptions(["all", ...providers], state.exposureProvider, "All providers")}
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title-row">
+          <div>
+            <h3>Exposure register</h3>
+            <p>${rows.length} of ${allRows.length} records shown. OSV entries are package-version matches; validate vendor-specific backports before closing remediation.</p>
+          </div>
+        </div>
+        ${renderExposureTable(rows)}
+      </section>
+    </article>
+  `;
+}
+
+function renderExposureTable(rows) {
+  if (!rows.length) {
+    return `<div class="workspace-empty"><strong>No matching exposure records</strong><p>Upload an SBOM, import cloud findings, enrich packages, or adjust the filters.</p></div>`;
+  }
+  return `
+    <div class="table-wrap">
+      <table class="exposure-table">
+        <thead><tr><th>Priority</th><th>Vulnerability</th><th>Package / Asset</th><th>Version / Fix</th><th>Evidence</th><th>VEX</th><th>Action</th></tr></thead>
+        <tbody>
+          ${rows.slice(0, 500).map((row) => `
+            <tr>
+              <td><span class="risk-badge risk-${escapeAttr(row.priority)}">${escapeHtml(row.priority)} ${row.priorityScore}</span></td>
+              <td><strong>${escapeHtml(row.vulnerability)}</strong><br><span class="muted-cell">${escapeHtml(row.severity || "Unknown")} ${row.kev ? "- KEV" : ""}${row.epss !== null ? ` - EPSS ${formatPercent(row.epss)}` : ""}</span></td>
+              <td><strong>${escapeHtml(row.packageName || row.assetName || "Unmapped")}</strong><br><span class="muted-cell">${escapeHtml(row.assetName || row.assetId || row.sourceFile || row.source)}</span></td>
+              <td>${escapeHtml(row.installedVersion || "n/a")}${row.fixedVersion ? `<br><span class="fixed-version">Fix: ${escapeHtml(row.fixedVersion)}</span>` : ""}</td>
+              <td>${escapeHtml(row.provider || row.source)}<br><span class="muted-cell">${escapeHtml(row.exploitStatus || "Unknown")}</span></td>
+              <td><span class="vex-badge vex-${escapeAttr(classToken(row.vexStatus))}">${escapeHtml(row.vexStatus)}</span>${row.vexJustification ? `<br><span class="muted-cell" title="${escapeAttr(row.vexJustification)}">${escapeHtml(row.vexJustification.slice(0, 90))}</span>` : ""}</td>
+              <td>${/^CVE-\d{4}-\d{4,}$/.test(row.vulnerability) ? `<button class="secondary-button table-button" type="button" data-action="research-exposure" data-value="${escapeAttr(row.vulnerability)}">Research</button>` : `<span class="muted-cell">Advisory only</span>`}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+    ${rows.length > 500 ? `<p class="table-note">Showing the first 500 filtered records. Export CSV for the full set.</p>` : ""}
+  `;
+}
+
+function selectOptions(values, selected, allLabel) {
+  return values.map((value) => `<option value="${escapeAttr(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(value === "all" ? allLabel : value)}</option>`).join("");
+}
+
+function exportExposureCsv() {
+  const rows = filteredExposureRows();
+  if (!rows.length) {
+    showToast("No exposure rows to export.");
+    return;
+  }
+  const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Justification", "Owner", "Workflow Status"];
+  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexJustification, row.owner, row.workflowStatus]);
+  download("vulnscope-exposure-register.csv", [headers, ...values].map((record) => record.map(csvCell).join(",")).join("\n"), "text/csv");
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function openBulkWorkspace() {
+  state.view = "bulk";
+  state.current = null;
+  state.activeSbomId = null;
+  state.activeEvidenceId = null;
+  elements.input.value = "";
+  render();
+}
+
+function renderBulkWorkspace() {
+  const complete = state.bulkQueue.filter((item) => item.status === "Complete").length;
+  const failed = state.bulkQueue.filter((item) => item.status === "Failed").length;
+  elements.content.innerHTML = `
+    <article class="investigation bulk-workspace">
+      <section class="brief-header">
+        <div class="brief-title">
+          <div class="badge-row">
+            <span class="badge">Bulk research</span>
+            <span class="badge">Maximum 25 CVEs</span>
+          </div>
+          <h2>Research a CVE campaign</h2>
+          <p>Paste CVE identifiers from scanner output, a ticket, or an advisory. VulnScope validates, deduplicates, and researches them sequentially to protect upstream sources.</p>
+        </div>
+        <div class="header-actions">
+          <button class="secondary-button" type="button" data-action="copy-monitor-config" ${state.watchlist.length ? "" : "disabled"}>Copy monitor config</button>
+          <button class="secondary-button" type="button" data-action="clear-bulk" ${state.bulkQueue.length && !state.bulkRunning ? "" : "disabled"}>Clear results</button>
+        </div>
+      </section>
+
+      <section class="panel bulk-input-panel">
+        <label class="field-label" for="bulkCves">CVE list</label>
+        <textarea id="bulkCves" class="textarea" placeholder="CVE-2021-44228\nCVE-2024-3094\nCVE-2023-22527" ${state.bulkRunning ? "disabled" : ""}>${escapeHtml(state.bulkInput)}</textarea>
+        <div class="panel-title-row bulk-run-row">
+          <p>Only valid CVE identifiers are queued. Duplicate identifiers are removed.</p>
+          <button class="primary-button" type="button" data-action="run-bulk" ${state.bulkRunning ? "disabled" : ""}>${state.bulkRunning ? "Researching..." : "Run research queue"}</button>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="Bulk research progress">
+        <div class="metric-card"><div class="metric-label">Queued</div><div class="metric-value">${state.bulkQueue.length}</div><div class="metric-detail">Unique CVEs</div></div>
+        <div class="metric-card"><div class="metric-label">Complete</div><div class="metric-value">${complete}</div><div class="metric-detail">Research records</div></div>
+        <div class="metric-card"><div class="metric-label">Failed</div><div class="metric-value">${failed}</div><div class="metric-detail">Retry individually</div></div>
+        <div class="metric-card"><div class="metric-label">Progress</div><div class="metric-value">${state.bulkQueue.length ? Math.round(((complete + failed) / state.bulkQueue.length) * 100) : 0}%</div><div class="metric-detail">Current queue</div></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title-row"><div><h3>Campaign results</h3><p>Completed records feed the exposure workspace and can be opened as full investigations.</p></div></div>
+        ${renderBulkResults()}
+      </section>
+    </article>
+  `;
+}
+
+function renderBulkResults() {
+  if (!state.bulkQueue.length) return `<div class="workspace-empty"><strong>No campaign is queued</strong><p>Paste one or more CVE identifiers above to begin.</p></div>`;
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>CVE</th><th>Status</th><th>Risk</th><th>KEV / EPSS</th><th>Real-world verdict</th><th>Action</th></tr></thead>
+        <tbody>${state.bulkQueue.map((item) => `
+          <tr>
+            <td><strong>${escapeHtml(item.id)}</strong></td>
+            <td><span class="badge">${escapeHtml(item.status)}</span>${item.error ? `<br><span class="muted-cell">${escapeHtml(item.error)}</span>` : ""}</td>
+            <td>${item.investigation ? `${escapeHtml(item.investigation.risk?.level || "Unknown")} ${item.investigation.risk?.score ?? ""}` : "n/a"}</td>
+            <td>${item.investigation?.metrics?.kev?.listed ? "KEV" : "Not KEV"}${item.investigation?.metrics?.epss?.epss !== null && item.investigation?.metrics?.epss?.epss !== undefined ? `<br><span class="muted-cell">EPSS ${formatPercent(item.investigation.metrics.epss.epss)}</span>` : ""}</td>
+            <td>${escapeHtml(item.investigation?.realWorld?.verdict || "Pending")}</td>
+            <td><button class="secondary-button table-button" type="button" data-action="open-bulk-result" data-value="${escapeAttr(item.id)}" ${item.investigation ? "" : "disabled"}>Open</button></td>
+          </tr>
+        `).join("")}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function runBulkResearch() {
+  if (state.bulkRunning) return;
+  const cves = uniqueValues(extractCves(state.bulkInput)).slice(0, 25);
+  if (!cves.length) {
+    showToast("Paste at least one valid CVE identifier.");
+    return;
+  }
+  state.bulkQueue = cves.map((id) => ({ id, status: "Queued", investigation: null, error: "" }));
+  state.bulkRunning = true;
+  if (state.view === "bulk") renderBulkWorkspace();
+  for (const item of state.bulkQueue) {
+    item.status = "Researching";
+    if (state.view === "bulk") renderBulkWorkspace();
+    try {
+      const response = await fetch(`/api/research?cve=${encodeURIComponent(item.id)}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || "Research failed.");
+      item.investigation = attachCaseDraft(normalizeInvestigationPayload(payload));
+      item.status = "Complete";
+    } catch (error) {
+      item.status = "Failed";
+      item.error = error.message || "Research failed.";
+    }
+    if (state.view === "bulk") renderBulkWorkspace();
+  }
+  state.bulkRunning = false;
+  if (state.view === "bulk") renderBulkWorkspace();
+  showToast(`Bulk research completed: ${state.bulkQueue.filter((item) => item.status === "Complete").length} of ${state.bulkQueue.length} records loaded.`);
+}
+
+function openBulkResult(id) {
+  const item = state.bulkQueue.find((entry) => entry.id === id);
+  if (!item?.investigation) return;
+  state.current = attachCaseDraft(item.investigation);
+  state.view = "investigation";
+  state.activeSbomId = null;
+  state.activeEvidenceId = null;
+  state.activeTab = "overview";
+  elements.input.value = id;
+  render();
+}
+
+function clearBulkResearch() {
+  if (state.bulkRunning) return;
+  state.bulkQueue = [];
+  state.bulkInput = "";
+  renderBulkWorkspace();
+  showToast("Bulk research results cleared.");
+}
+
+async function copyMonitorConfiguration() {
+  const cves = uniqueValues(state.watchlist.map((item) => item.id));
+  if (!cves.length) {
+    showToast("Add CVEs to the watchlist before creating monitor configuration.");
+    return;
+  }
+  const command = `MONITORED_CVES=${cves.join(",")} NOTIFICATION_EMAIL=Jayson.Guglietta@gmail.com npm run deploy:aws`;
+  await copyTextBlock(command, "Deployment monitor configuration copied.");
 }
 
 function openSbomCve(cve) {
@@ -520,6 +1079,7 @@ function openSbomCveReport(reportId, cve) {
   const report = state.sbomReports.find((item) => item.id === reportId);
   if (!report?.cves.some((entry) => entry.id === cve)) return;
   state.activeSbomId = report.id;
+  state.view = "sbom";
   state.activeSbomCveId = cve;
   state.current = null;
   elements.input.value = "";
@@ -634,7 +1194,13 @@ function parseCycloneDxJson(file, json) {
       fileName: file.name,
       componentRefs,
       components: componentNames,
-      references: extractUrls(safeStringify(vulnerability))
+      references: extractUrls(safeStringify(vulnerability)),
+      vex: vulnerability.analysis ? {
+        status: normalizeVexState(vulnerability.analysis.state),
+        justification: vulnerability.analysis.justification || "",
+        response: normalizeArray(vulnerability.analysis.response),
+        detail: vulnerability.analysis.detail || ""
+      } : null
     }));
   });
 
@@ -988,6 +1554,8 @@ function buildSbomReport(parsedFiles, warnings = []) {
       sources: new Set(),
       severities: new Set(),
       references: new Set(),
+      vexStatuses: new Set(),
+      vexDetails: [],
       affectedPackages: new Map(),
       count: 0
     };
@@ -996,6 +1564,8 @@ function buildSbomReport(parsedFiles, warnings = []) {
     entry.sources.add(vulnerability.source || "SBOM");
     if (vulnerability.severity) entry.severities.add(vulnerability.severity);
     for (const ref of vulnerability.references || []) entry.references.add(ref);
+    if (vulnerability.vex?.status) entry.vexStatuses.add(vulnerability.vex.status);
+    if (vulnerability.vex) entry.vexDetails.push(vulnerability.vex);
     for (const affectedPackage of findSbomAffectedPackages(vulnerability, components)) {
       entry.affectedPackages.set(sbomAffectedPackageKey(affectedPackage), affectedPackage);
     }
@@ -1009,6 +1579,8 @@ function buildSbomReport(parsedFiles, warnings = []) {
     sources: [...entry.sources],
     severity: highestSeverity([...entry.severities]),
     references: [...entry.references].slice(0, 6),
+    vexStatus: selectVexStatus([...entry.vexStatuses]),
+    vex: entry.vexDetails[0] || null,
     affectedPackages: [...entry.affectedPackages.values()],
     count: entry.count
   })).sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || sortCveId(b.id) - sortCveId(a.id));
@@ -1058,12 +1630,17 @@ function confirmSensitiveExport(format) {
 }
 
 function clearLocalData() {
-  if (!window.confirm("Delete saved cases, watchlist data, and SBOM uploads from this browser?")) return;
+  if (!window.confirm("Delete saved cases, watchlist data, SBOM uploads, enrichment results, imported evidence, and bulk results from this browser?")) return;
   state.cases = [];
   state.watchlist = [];
   state.sbomReports = [];
+  state.enrichmentReports = [];
+  state.evidenceReports = [];
+  state.bulkQueue = [];
+  state.bulkInput = "";
   state.activeSbomId = null;
   state.activeSbomCveId = null;
+  state.activeEvidenceId = null;
   localStorage.removeItem("cve-research-cases");
   localStorage.removeItem("cve-research-watchlist");
   if (state.current) {
@@ -1072,9 +1649,10 @@ function clearLocalData() {
   renderCases();
   renderWatchlist();
   renderSbomList();
+  renderEvidenceList();
   if (state.current) render();
   if (!state.current) render();
-  showToast("Local cases, watchlist, and SBOM uploads cleared.");
+  showToast("Local VulnScope workspace data cleared.");
 }
 
 function exportJson() {
@@ -1090,6 +1668,18 @@ function exportMarkdown() {
 }
 
 function render() {
+  if (state.view === "exposures") {
+    renderExposureWorkspace();
+    return;
+  }
+  if (state.view === "bulk") {
+    renderBulkWorkspace();
+    return;
+  }
+  if (state.view === "evidence") {
+    renderEvidenceWorkspace();
+    return;
+  }
   if (!state.current) {
     const report = getActiveSbomReport();
     if (report) {
@@ -1132,6 +1722,78 @@ function render() {
   `;
   renderCases();
   renderSbomList();
+  renderEvidenceList();
+}
+
+function renderEvidenceWorkspace() {
+  const report = state.evidenceReports.find((item) => item.id === state.activeEvidenceId) || state.evidenceReports[0];
+  if (!report) {
+    openExposureWorkspace();
+    return;
+  }
+  elements.content.innerHTML = `
+    <article class="investigation">
+      <section class="brief-header">
+        <div class="brief-title">
+          <div class="badge-row">
+            <span class="badge">Imported evidence</span>
+            <span class="badge">${escapeHtml(report.format)}</span>
+          </div>
+          <h2>${escapeHtml(report.fileName)}</h2>
+          <p>${escapeHtml(report.summary || "Imported cloud and vulnerability evidence.")}</p>
+        </div>
+        <div class="header-actions">
+          <label class="secondary-button" for="evidenceInput">Import more</label>
+          <button class="primary-button" type="button" data-action="open-exposures">Open exposure workspace</button>
+        </div>
+      </section>
+      <section class="metric-grid" aria-label="Evidence import metrics">
+        <div class="metric-card"><div class="metric-label">Findings</div><div class="metric-value">${report.findings.length}</div><div class="metric-detail">Vulnerability evidence rows</div></div>
+        <div class="metric-card"><div class="metric-label">Assets</div><div class="metric-value">${report.assets.length}</div><div class="metric-detail">Unique cloud resources</div></div>
+        <div class="metric-card"><div class="metric-label">VEX statements</div><div class="metric-value">${report.vexStatements.length}</div><div class="metric-detail">Disposition records</div></div>
+        <div class="metric-card"><div class="metric-label">Warnings</div><div class="metric-value">${report.warnings.length}</div><div class="metric-detail">Parser notes</div></div>
+      </section>
+      ${report.warnings.length ? `<section class="notice warning"><strong>Import notes</strong><ul>${report.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul></section>` : ""}
+      <section class="panel">
+        <div class="panel-title-row"><div><h3>VEX assertions</h3><p>Imported affected-state decisions and supporting rationale.</p></div></div>
+        ${renderVexStatements(report.vexStatements)}
+      </section>
+      <section class="panel">
+        <div class="panel-title-row"><div><h3>Cloud and package findings</h3><p>Imported records are normalized into the exposure workspace.</p></div></div>
+        ${renderImportedFindings(report.findings)}
+      </section>
+      <section class="panel">
+        <div class="panel-title-row"><div><h3>Assets</h3><p>Resources referenced by imported findings.</p></div></div>
+        ${renderImportedAssets(report.assets)}
+      </section>
+    </article>
+  `;
+}
+
+function renderVexStatements(statements) {
+  if (!statements.length) return `<p>No VEX statements were found in this file.</p>`;
+  return `<div class="card-grid">${statements.slice(0, 100).map((statement) => `
+    <div class="action-item">
+      <div class="badge-row"><span class="badge">${escapeHtml(statement.vulnerability)}</span><span class="vex-badge">${escapeHtml(statement.status)}</span></div>
+      <strong>${escapeHtml(statement.products.join(", ") || "All referenced products")}</strong>
+      <p>${escapeHtml(statement.justification || statement.impact || statement.detail || "No justification supplied.")}</p>
+      ${statement.action ? `<p><strong>Action:</strong> ${escapeHtml(statement.action)}</p>` : ""}
+    </div>
+  `).join("")}</div>${statements.length > 100 ? `<p class="table-note">Showing the first 100 VEX statements.</p>` : ""}`;
+}
+
+function renderImportedFindings(findings) {
+  if (!findings.length) return `<p>No cloud vulnerability finding rows were found in this file.</p>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Vulnerability</th><th>Severity</th><th>Package</th><th>Asset</th><th>Fix</th><th>Source</th></tr></thead><tbody>${findings.slice(0, 300).map((finding) => `
+    <tr><td><strong>${escapeHtml(finding.vulnerability)}</strong></td><td>${escapeHtml(finding.severity)}</td><td>${escapeHtml(finding.packageName || "n/a")} ${escapeHtml(finding.installedVersion || "")}</td><td>${escapeHtml(finding.assetName || finding.assetId || "Unmapped")}</td><td>${escapeHtml(finding.fixedVersion || finding.remediation || "Validate vendor guidance")}</td><td>${escapeHtml(finding.source)}</td></tr>
+  `).join("")}</tbody></table></div>${findings.length > 300 ? `<p class="table-note">Showing the first 300 findings.</p>` : ""}`;
+}
+
+function renderImportedAssets(assets) {
+  if (!assets.length) return `<p>No explicit cloud assets were found in this file.</p>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Provider</th><th>Asset</th><th>Type</th><th>Account</th><th>Region</th></tr></thead><tbody>${assets.slice(0, 300).map((asset) => `
+    <tr><td>${escapeHtml(asset.provider || "Cloud")}</td><td><strong>${escapeHtml(asset.name)}</strong><br><span class="muted-cell">${escapeHtml(asset.id)}</span></td><td>${escapeHtml(asset.type)}</td><td>${escapeHtml(asset.account || "n/a")}</td><td>${escapeHtml(asset.region || "n/a")}</td></tr>
+  `).join("")}</tbody></table></div>`;
 }
 
 function renderStaleBanner(item) {
@@ -1950,6 +2612,14 @@ function renderSourceResult(source) {
   `;
 }
 
+function mergeSourceHealth(results) {
+  if (!Array.isArray(results)) return;
+  const merged = new Map(state.sourceHealth.map((source) => [source.id, source]));
+  for (const source of results) merged.set(source.id, { ...merged.get(source.id), ...source });
+  state.sourceHealth = [...merged.values()];
+  renderHealth();
+}
+
 function renderWatchlist() {
   if (!elements.watchList) return;
   if (!state.watchlist.length) {
@@ -2009,6 +2679,8 @@ function renderSbomWorkspace(report) {
         </div>
         <div class="header-actions">
           <label class="secondary-button" for="sbomInput">Upload more</label>
+          <button class="secondary-button" type="button" data-action="enrich-sbom" ${state.enriching ? "disabled" : ""}>${state.enriching ? "Enriching..." : "Enrich packages online"}</button>
+          <button class="secondary-button" type="button" data-action="open-exposures">View exposures</button>
           <button class="secondary-button" type="button" data-action="copy-sbom-cves">Copy CVEs</button>
           <button class="secondary-button" type="button" data-action="export-sbom-json">Export JSON</button>
         </div>
@@ -2037,6 +2709,8 @@ function renderSbomWorkspace(report) {
         </div>
       </section>
 
+      ${renderSbomEnrichment(report)}
+
       <section class="tab-panel">
         ${renderSbomWarnings(report)}
         <div class="panel">
@@ -2063,6 +2737,15 @@ function renderSbomWorkspace(report) {
   `;
 }
 
+function renderSbomEnrichment(report) {
+  const enrichment = state.enrichmentReports.find((item) => item.sbomId === report.id);
+  if (!enrichment) {
+    return `<section class="panel enrichment-panel"><div class="panel-title-row"><div><h3>Package vulnerability enrichment</h3><p>Not run. The uploaded file remains local; choosing online enrichment sends only supported package identifiers to OSV.</p></div><span class="badge">Opt-in</span></div></section>`;
+  }
+  const matchedPackages = enrichment.packages.filter((pkg) => pkg.vulnerabilities?.length).length;
+  return `<section class="panel enrichment-panel found"><div class="panel-title-row"><div><h3>OSV package enrichment</h3><p>${matchedPackages} of ${enrichment.packageCount} queried packages matched ${enrichment.vulnerabilityCount} vulnerability records.${enrichment.truncated ? " Results were capped; split the SBOM for additional detail." : ""}</p></div><span class="badge">${formatDateTime(enrichment.generatedAt)}</span></div></section>`;
+}
+
 function renderSbomWarnings(report) {
   if (!report.warnings.length) return "";
   return `
@@ -2087,6 +2770,7 @@ function renderSbomCveTable(report) {
           <tr>
             <th>CVE</th>
             <th>Severity</th>
+            <th>VEX</th>
             <th>Components</th>
             <th>Files</th>
             <th>Action</th>
@@ -2097,6 +2781,7 @@ function renderSbomCveTable(report) {
             <tr class="${activeCve === entry.id ? "selected-row" : ""}">
               <td><button class="link-button" type="button" data-action="open-sbom-cve" data-value="${escapeAttr(entry.id)}" aria-pressed="${activeCve === entry.id ? "true" : "false"}">${escapeHtml(entry.id)}</button></td>
               <td>${escapeHtml(entry.severity || "Unknown")}</td>
+              <td><span class="vex-badge">${escapeHtml(entry.vexStatus || "Unreviewed")}</span></td>
               <td>${escapeHtml(entry.affectedPackages?.slice(0, 3).map((pkg) => pkg.label).join(", ") || entry.components.slice(0, 3).join(", ") || "No component listed")}</td>
               <td>${escapeHtml(entry.files.slice(0, 2).join(", "))}</td>
               <td><button class="secondary-button table-button" type="button" data-action="research-sbom-cve" data-value="${escapeAttr(entry.id)}">Research</button></td>
@@ -2775,6 +3460,23 @@ function normalizeSeverity(value) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+function normalizeVexState(value) {
+  const state = String(value || "").trim().toLowerCase().replace(/[ -]+/g, "_");
+  if (["affected", "known_affected", "exploitable"].includes(state)) return "Affected";
+  if (["not_affected", "known_not_affected", "not_exploitable"].includes(state)) return "Not affected";
+  if (["fixed", "resolved"].includes(state)) return "Fixed";
+  if (["under_investigation", "in_triage"].includes(state)) return "Under investigation";
+  return state ? labelize(state) : "Unknown";
+}
+
+function selectVexStatus(values) {
+  const statuses = uniqueValues(values);
+  for (const status of ["Affected", "Under investigation", "Fixed", "Not affected"]) {
+    if (statuses.includes(status)) return status;
+  }
+  return statuses[0] || "Unreviewed";
+}
+
 function highestSeverity(values) {
   return uniqueValues(values).sort((a, b) => severityRank(b) - severityRank(a))[0] || "";
 }
@@ -2923,4 +3625,8 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, "&#096;");
+}
+
+function classToken(value) {
+  return String(value || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
 }

@@ -2,9 +2,15 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
+AWS_PROFILE="${AWS_PROFILE:-json}"
+EXPECTED_AWS_ACCOUNT_ID="${EXPECTED_AWS_ACCOUNT_ID:-171058045575}"
 STACK_NAME="${STACK_NAME:-vulnscope-prod}"
 DOMAIN_NAME="${DOMAIN_NAME:-vulnscope.jsontechnology.com}"
 ROOT_DOMAIN="${ROOT_DOMAIN:-jsontechnology.com}"
+NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
+MONITORED_CVES="${MONITORED_CVES:-}"
+MONITOR_SCHEDULE="${MONITOR_SCHEDULE:-rate(1 day)}"
+export AWS_PROFILE
 
 if [[ "${REGION}" != "us-east-1" ]]; then
   echo "VulnScope CloudFront ACM certificates must be deployed from us-east-1." >&2
@@ -12,6 +18,12 @@ if [[ "${REGION}" != "us-east-1" ]]; then
 fi
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+if [[ "${ACCOUNT_ID}" != "${EXPECTED_AWS_ACCOUNT_ID}" ]]; then
+  echo "Refusing to deploy to AWS account ${ACCOUNT_ID}; expected ${EXPECTED_AWS_ACCOUNT_ID}." >&2
+  echo "Set EXPECTED_AWS_ACCOUNT_ID deliberately when deploying another account." >&2
+  exit 1
+fi
+
 HOSTED_ZONE_ID="$(
   aws route53 list-hosted-zones-by-name \
     --dns-name "${ROOT_DOMAIN}." \
@@ -33,6 +45,7 @@ LAMBDA_CODE_KEY="lambda/vulnscope-${BUILD_ID}.zip"
 BUILD_DIR=".deploy/lambda"
 
 echo "Deploying VulnScope"
+echo "  profile: ${AWS_PROFILE}"
 echo "  account: ${ACCOUNT_ID}"
 echo "  region: ${REGION}"
 echo "  domain: ${DOMAIN_NAME}"
@@ -45,9 +58,14 @@ if ! aws s3api head-bucket --bucket "${ARTIFACT_BUCKET}" >/dev/null 2>&1; then
     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
 fi
 
+aws s3api put-bucket-encryption \
+  --bucket "${ARTIFACT_BUCKET}" \
+  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null
+
 rm -rf ".deploy"
 mkdir -p "${BUILD_DIR}"
-cp server.mjs lambda.mjs package.json "${BUILD_DIR}/"
+cp server.mjs lambda.mjs monitor.mjs package.json package-lock.json "${BUILD_DIR}/"
+(cd "${BUILD_DIR}" && npm ci --omit=dev --ignore-scripts >/dev/null)
 (cd "${BUILD_DIR}" && zip -qr "../lambda.zip" .)
 
 aws s3 cp ".deploy/lambda.zip" "s3://${ARTIFACT_BUCKET}/${LAMBDA_CODE_KEY}" >/dev/null
@@ -63,7 +81,10 @@ aws cloudformation deploy \
     HostedZoneId="${HOSTED_ZONE_ID}" \
     StaticBucketName="${STATIC_BUCKET}" \
     LambdaCodeBucket="${ARTIFACT_BUCKET}" \
-    LambdaCodeKey="${LAMBDA_CODE_KEY}"
+    LambdaCodeKey="${LAMBDA_CODE_KEY}" \
+    NotificationEmail="${NOTIFICATION_EMAIL}" \
+    MonitoredCves="${MONITORED_CVES}" \
+    MonitorScheduleExpression="${MONITOR_SCHEDULE}"
 
 OUTPUTS="$(
   aws cloudformation describe-stacks \

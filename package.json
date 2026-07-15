@@ -1,17 +1,21 @@
 {
   "name": "vulnscope",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs",
-    "check:client": "node --check public/app.js",
+    "check": "node --check server.mjs && node --check lambda.mjs && node --check monitor.mjs",
+    "check:client": "node --check public/app.js && node --check public/sbom-worker.js && node --check public/modules/sbom-worker-core.js && node --check public/modules/workspace.js",
     "test": "node scripts/security-smoke.mjs && node scripts/sbom-parser-smoke.mjs",
     "verify": "npm run check && npm run check:client && npm test && npm audit --omit=dev",
     "deploy:aws": "bash scripts/deploy-aws.sh"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1087.0",
+    "@aws-sdk/client-sns": "^3.1087.0"
   }
 }

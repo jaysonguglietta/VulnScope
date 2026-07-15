@@ -1,79 +1,82 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { parseSbomPayload } from "../public/modules/sbom-worker-core.js";
+import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "../public/modules/workspace.js";
 
-class FakeElement {
-  constructor() {
-    this.value = "";
-    this.textContent = "";
-    this.hidden = false;
-    this.dataset = {};
-    this.files = [];
-    this.content = { cloneNode: () => ({}) };
-  }
-  addEventListener() {}
-  setAttribute() {}
-  removeAttribute() {}
-  replaceChildren() {}
-  focus() {}
-}
+const sampleText = await readFile(new URL("fixtures/sample-cyclonedx.json", import.meta.url), "utf8");
+const result = parseSbomPayload({ name: "sample-cyclonedx.json", size: sampleText.length }, sampleText);
+assert.equal(result.handled, true, "CycloneDX JSON should be handled in the background parser");
+assert.equal(result.parsed.format, "CycloneDX 1.5");
+assert.equal(result.parsed.components.length, 1);
+assert(result.parsed.vulnerabilities.some((item) => item.cve === "CVE-2021-44228"));
+assert(result.parsed.vulnerabilities.some((item) => item.components.some((component) => component.includes("log4j-core"))));
 
-const fakeElement = new FakeElement();
-globalThis.document = {
-  querySelector: () => fakeElement,
-  querySelectorAll: () => [],
-  addEventListener: () => {},
-  createElement: () => fakeElement,
-  body: { append: () => {} }
+const openVex = JSON.stringify({
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  statements: [{
+    vulnerability: { name: "CVE-2021-44228" },
+    products: [{ "@id": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1" }],
+    status: "not_affected",
+    justification: "vulnerable_code_not_in_execute_path"
+  }]
+});
+const vexReport = parseEvidenceFile({ name: "status.openvex.json", size: openVex.length }, openVex);
+assert.equal(vexReport.format, "OpenVEX");
+assert.equal(vexReport.vexStatements[0].status, "Not affected");
+
+const sbomReport = {
+  title: "production-api",
+  cves: [{
+    id: "CVE-2021-44228",
+    severity: "Critical",
+    files: ["sample-cyclonedx.json"],
+    affectedPackages: [{
+      name: "org.apache.logging.log4j/log4j-core",
+      version: "2.14.1",
+      purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+      fileName: "sample-cyclonedx.json"
+    }]
+  }]
 };
-globalThis.window = {
-  confirm: () => true
-};
-globalThis.localStorage = {
-  getItem: () => null,
-  setItem: () => {},
-  removeItem: () => {}
-};
-Object.defineProperty(globalThis, "navigator", {
-  configurable: true,
-  value: {
-    clipboard: {
-      writeText: async () => {}
+const exposureRows = buildExposureRows({ sbomReports: [sbomReport], evidenceReports: [vexReport] });
+assert.equal(exposureRows.length, 1);
+assert.equal(exposureRows[0].vulnerability, "CVE-2021-44228");
+assert.equal(exposureRows[0].vexStatus, "Not affected");
+assert.equal(exposureRows[0].priorityScore, 0);
+assert.equal(summarizeExposureRows(exposureRows).notAffected, 1);
+
+const isolatedProducts = buildExposureRows({
+  evidenceReports: [{
+    findings: [
+      { vulnerability: "CVE-2021-44228", packageName: "log4j-core", purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1" },
+      { vulnerability: "CVE-2021-44228", packageName: "unrelated-package", purl: "pkg:npm/unrelated-package@1.0.0" }
+    ],
+    vexStatements: [{
+      vulnerability: "CVE-2021-44228",
+      aliases: [],
+      products: ["pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"],
+      status: "Not affected",
+      justification: "Component is unreachable."
+    }]
+  }]
+});
+assert.equal(isolatedProducts.find((row) => row.packageName === "log4j-core").vexStatus, "Not affected");
+assert.equal(isolatedProducts.find((row) => row.packageName === "unrelated-package").vexStatus, "Unknown");
+
+const inspector = JSON.stringify({
+  findings: [{
+    title: "Log4j finding",
+    severity: "CRITICAL",
+    resources: [{ id: "arn:aws:ecr:us-east-1:123456789012:repository/api", type: "AWS_ECR_CONTAINER_IMAGE", region: "us-east-1" }],
+    packageVulnerabilityDetails: {
+      vulnerabilityId: "CVE-2021-44228",
+      vulnerablePackages: [{ name: "log4j-core", version: "2.14.1", fixedInVersion: "2.17.1", packageManager: "MAVEN" }]
     }
-  }
+  }]
 });
-globalThis.requestAnimationFrame = (callback) => callback();
-globalThis.fetch = async () => ({
-  json: async () => ({ sources: [] })
-});
+const inspectorReport = parseEvidenceFile({ name: "inspector.json", size: inspector.length }, inspector);
+assert.equal(inspectorReport.format, "Amazon Inspector findings");
+assert.equal(inspectorReport.findings[0].provider, "AWS");
+assert.equal(inspectorReport.findings[0].fixedVersion, "2.17.1");
 
-const appSource = readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
-const sample = readFileSync(new URL("fixtures/sample-cyclonedx.json", import.meta.url), "utf8");
-const testSource = `${appSource}
-
-function smokeAssert(condition, message) {
-  if (!condition) {
-    throw new Error(message);
-  }
-}
-
-const sampleText = ${JSON.stringify(sample)};
-const parsed = parseSbomFile({ name: "sample-cyclonedx.json", size: sampleText.length }, sampleText);
-const report = buildSbomReport([parsed], []);
-const log4shell = report.cves.find((entry) => entry.id === "CVE-2021-44228");
-state.sbomReports = [report];
-const exactMatches = findSbomCveMatches("CVE-2021-44228");
-smokeAssert(parsed.format === "CycloneDX 1.5", "expected CycloneDX parser");
-smokeAssert(report.components.length === 1, "expected one component");
-smokeAssert(Boolean(log4shell), "expected Log4Shell CVE");
-smokeAssert(report.vulnerabilities.some((entry) => entry.components.some((component) => component.includes("log4j-core"))), "expected affected component mapping");
-smokeAssert(log4shell.affectedPackages.some((pkg) => pkg.name.includes("log4j-core") && pkg.version === "2.14.1"), "expected Log4Shell package mapping");
-smokeAssert(exactMatches.length === 1 && exactMatches[0].entry.id === "CVE-2021-44228", "expected exact searched-CVE SBOM match");
-`;
-
-const tempDir = mkdtempSync(join(tmpdir(), "vulnscope-sbom-test-"));
-const tempModule = join(tempDir, "sbom-parser-test.mjs");
-writeFileSync(tempModule, testSource);
-await import(pathToFileURL(tempModule).href);
-console.log("sbom parser smoke test passed");
+console.log("sbom, VEX, cloud evidence, and exposure tests passed");

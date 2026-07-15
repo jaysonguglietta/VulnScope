@@ -16,8 +16,20 @@ try {
   const health = request("/api/health");
   assert(health.status === 200, `expected /api/health to return 200, got ${health.status}`);
   const healthJson = JSON.parse(health.body);
-  assert(Array.isArray(healthJson.sources) && healthJson.sources.length >= 8, "health should return source catalog");
+  assert(Array.isArray(healthJson.sources) && healthJson.sources.length >= 10, "health should return source catalog");
   assert(!Object.hasOwn(healthJson.sources[0], "configured"), "health should not expose token configuration state");
+  assert(healthJson.sources.every((source) => ["unknown", "optional", "ok", "error", "skipped"].includes(source.status)), "health should return truthful source state");
+
+  const methodRejected = request("/api/research?cve=CVE-2023-22527", { method: "POST" });
+  assert(methodRejected.status === 405, `expected POST research to return 405, got ${methodRejected.status}`);
+  assert(methodRejected.headers.allow === "GET", "method rejection should identify the allowed method");
+
+  const invalidEnrichment = request("/api/enrich", {
+    method: "POST",
+    body: JSON.stringify({ packages: [{ name: "missing-version" }] }),
+    headers: ["content-type: application/json"]
+  });
+  assert(invalidEnrichment.status === 400, `expected invalid enrichment to return 400, got ${invalidEnrichment.status}`);
 
   const invalid = request("/api/research?cve=not-a-cve");
   assert(invalid.status === 400, `expected invalid CVE to return 400, got ${invalid.status}`);
@@ -92,8 +104,12 @@ async function getFreePort() {
   return port;
 }
 
-function request(pathname) {
-  const result = spawnSync("curl", ["-sS", "-D", "-", `${rootUrl}${pathname}`], {
+function request(pathname, options = {}) {
+  const args = ["-sS", "-D", "-", "-X", options.method || "GET"];
+  for (const header of options.headers || []) args.push("-H", header);
+  if (options.body !== undefined) args.push("--data-binary", options.body);
+  args.push(`${rootUrl}${pathname}`);
+  const result = spawnSync("curl", args, {
     encoding: "utf8",
     maxBuffer: 1024 * 1024
   });

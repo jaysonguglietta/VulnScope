@@ -6,9 +6,12 @@ export async function handler(event) {
     const query = new URLSearchParams(event.rawQueryString || "");
     const response = await handleApiRequest({
       path,
+      method: event.requestContext?.http?.method || "GET",
       query,
       headers: normalizeHeaders(event.headers || {}),
-      remoteAddress: event.requestContext?.http?.sourceIp || "unknown"
+      remoteAddress: event.requestContext?.http?.sourceIp || "unknown",
+      trustedClientAddress: event.requestContext?.http?.sourceIp || "unknown",
+      body: decodeBody(event)
     });
 
     if (response) {
@@ -42,6 +45,11 @@ export async function handler(event) {
       isBase64Encoded: false
     };
   }
+}
+
+function decodeBody(event) {
+  if (!event.body) return "";
+  return event.isBase64Encoded ? Buffer.from(event.body, "base64").toString("utf8") : String(event.body);
 }
 
 function normalizeHeaders(headers) {

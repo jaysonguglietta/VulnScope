@@ -19,9 +19,13 @@ const researchConcurrency = positiveInt(process.env.RESEARCH_CONCURRENCY, 4);
 const researchQueueMax = positiveInt(process.env.RESEARCH_QUEUE_MAX, 20);
 const outboundConcurrency = positiveInt(process.env.OUTBOUND_CONCURRENCY, 8);
 const outboundQueueMax = positiveInt(process.env.OUTBOUND_QUEUE_MAX, 50);
+const apiBodyMaxBytes = positiveInt(process.env.API_BODY_MAX_BYTES, 256 * 1024);
+const enrichmentPackageMax = positiveInt(process.env.ENRICHMENT_PACKAGE_MAX, 200);
+const enrichmentVulnerabilityMax = positiveInt(process.env.ENRICHMENT_VULNERABILITY_MAX, 120);
 const rateLimitBuckets = new Map();
 const researchQueue = [];
 const outboundQueue = [];
+const sourceTelemetry = new Map();
 let activeResearch = 0;
 let activeOutbound = 0;
 
@@ -82,6 +86,12 @@ const sourceCatalog = [
     url: "https://api.github.com/search/issues"
   },
   {
+    id: "githubAdvisories",
+    label: "GitHub Advisory Database",
+    kind: "official",
+    url: "https://api.github.com/advisories"
+  },
+  {
     id: "hackerNews",
     label: "Hacker News Chatter",
     kind: "public-search",
@@ -98,6 +108,12 @@ const sourceCatalog = [
     label: "VulnCheck Exploit Intel",
     kind: "optional-token",
     url: "https://api.vulncheck.com/v3/index/exploits"
+  },
+  {
+    id: "osv",
+    label: "OSV Package Intelligence",
+    kind: "package-intelligence",
+    url: "https://api.osv.dev/v1/querybatch"
   }
 ];
 
@@ -283,14 +299,20 @@ function setCachedResearch(cve, payload) {
 }
 
 function getClientKey(req) {
+  if (req.trustedClientAddress) return req.trustedClientAddress;
   const remoteAddress = req.socket?.remoteAddress || "unknown";
-  if (process.env.TRUST_PROXY === "1") {
+  if (process.env.TRUST_PROXY === "1" && isLoopbackAddress(remoteAddress)) {
     const forwardedFor = req.headers["x-forwarded-for"];
     const forwardedValue = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
     const firstForwarded = forwardedValue?.split(",")[0]?.trim();
     if (firstForwarded) return firstForwarded;
   }
   return remoteAddress;
+}
+
+function isLoopbackAddress(value) {
+  const address = String(value || "").toLowerCase();
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
 function checkResearchRateLimit(req, refresh) {
@@ -426,11 +448,17 @@ function clientSafeError(error) {
 export async function appRequestHandler(req, res) {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const method = String(req.method || "GET").toUpperCase();
+    const body = url.pathname.startsWith("/api/") && !["GET", "HEAD"].includes(method)
+      ? await readLimitedRequestBody(req)
+      : "";
     const apiResponse = await handleApiRequest({
       path: url.pathname,
+      method,
       query: url.searchParams,
       headers: req.headers,
-      remoteAddress: req.socket?.remoteAddress
+      remoteAddress: req.socket?.remoteAddress,
+      body
     });
     if (apiResponse) {
       writeApiResponse(res, apiResponse);
@@ -440,26 +468,44 @@ export async function appRequestHandler(req, res) {
     await serveStatic(url.pathname, res);
   } catch (error) {
     console.error(error);
-    sendJson(res, genericServerErrorBody(), 500);
+    const status = Number(error?.statusCode) || 500;
+    const body = status === 500
+      ? genericServerErrorBody()
+      : { error: true, message: error?.clientMessage || "Request rejected." };
+    sendJson(res, body, status);
   }
 }
 
-export async function handleApiRequest({ path, query, headers = {}, remoteAddress = "unknown" }) {
+export async function handleApiRequest({
+  path,
+  method = "GET",
+  query = new URLSearchParams(),
+  headers = {},
+  remoteAddress = "unknown",
+  trustedClientAddress = "",
+  body = ""
+}) {
+  const normalizedMethod = String(method || "GET").toUpperCase();
   if (path === "/api/health") {
+    if (normalizedMethod !== "GET") return methodNotAllowed(["GET"]);
     return jsonApiResponse({
       ok: true,
       generatedAt: new Date().toISOString(),
       sources: sourceCatalog.map((source) => ({
+        ...sourceTelemetry.get(source.id),
         id: source.id,
         label: source.label,
         kind: source.kind,
         url: source.url,
-        optional: source.kind === "optional-token"
+        optional: source.kind === "optional-token",
+        status: sourceTelemetry.get(source.id)?.status || (source.kind === "optional-token" ? "optional" : "unknown"),
+        message: sourceTelemetry.get(source.id)?.message || (source.kind === "optional-token" ? "Optional source has not been queried." : "No live source check has run in this process.")
       }))
     });
   }
 
   if (path === "/api/research") {
+    if (normalizedMethod !== "GET") return methodNotAllowed(["GET"]);
     const cve = normalizeCve(query.get("cve"));
     const refresh = query.get("refresh") === "1";
     if (!cve) {
@@ -472,7 +518,7 @@ export async function handleApiRequest({ path, query, headers = {}, remoteAddres
       );
     }
 
-    const rateLimit = checkResearchRateLimit({ headers, socket: { remoteAddress } }, refresh);
+    const rateLimit = checkResearchRateLimit({ headers, socket: { remoteAddress }, trustedClientAddress }, refresh);
     if (!rateLimit.allowed) {
       return jsonApiResponse(
         {
@@ -505,7 +551,71 @@ export async function handleApiRequest({ path, query, headers = {}, remoteAddres
     return jsonApiResponse(payload);
   }
 
+  if (path === "/api/enrich") {
+    if (normalizedMethod !== "POST") return methodNotAllowed(["POST"]);
+    if (Buffer.byteLength(String(body || ""), "utf8") > apiBodyMaxBytes) {
+      return jsonApiResponse({ error: true, message: "Enrichment request is too large." }, 413);
+    }
+    const request = parseJsonBody(body);
+    if (!request.ok) return jsonApiResponse({ error: true, message: request.message }, 400);
+    const packages = normalizeEnrichmentPackages(request.value?.packages);
+    if (!packages.length) {
+      return jsonApiResponse({ error: true, message: "Provide at least one package with a package URL or an ecosystem, name, and version." }, 400);
+    }
+    const rateLimit = checkResearchRateLimit({ headers, socket: { remoteAddress }, trustedClientAddress }, false);
+    if (!rateLimit.allowed) {
+      return jsonApiResponse({ error: true, message: rateLimit.message }, 429, { "retry-after": String(rateLimit.retryAfterSeconds) });
+    }
+    if (!canAcceptResearch()) {
+      return jsonApiResponse({ error: true, message: "The research queue is busy. Try again shortly." }, 503, { "retry-after": "10" });
+    }
+    const payload = await withResearchSlot(() => enrichPackages(packages));
+    return jsonApiResponse(payload);
+  }
+
+  if (path.startsWith("/api/")) {
+    return jsonApiResponse({ error: true, message: "API route not found." }, 404);
+  }
   return null;
+}
+
+function methodNotAllowed(allowed) {
+  return jsonApiResponse(
+    { error: true, message: `Method not allowed. Use ${allowed.join(" or ")}.` },
+    405,
+    { allow: allowed.join(", ") }
+  );
+}
+
+async function readLimitedRequestBody(req) {
+  const declaredLength = Number(req.headers["content-length"] || 0);
+  if (declaredLength > apiBodyMaxBytes) {
+    const error = new Error("Request body too large.");
+    error.statusCode = 413;
+    error.clientMessage = "Request body is too large.";
+    throw error;
+  }
+  const chunks = [];
+  let received = 0;
+  for await (const chunk of req) {
+    received += chunk.length;
+    if (received > apiBodyMaxBytes) {
+      const error = new Error("Request body too large.");
+      error.statusCode = 413;
+      error.clientMessage = "Request body is too large.";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, received).toString("utf8");
+}
+
+function parseJsonBody(body) {
+  try {
+    return { ok: true, value: JSON.parse(String(body || "{}")) };
+  } catch {
+    return { ok: false, message: "Request body must be valid JSON." };
+  }
 }
 
 const server = createServer(appRequestHandler);
@@ -556,7 +666,7 @@ async function serveStatic(pathname, res) {
   }
 }
 
-async function researchCve(cve) {
+export async function researchCve(cve) {
   const generatedAt = new Date().toISOString();
   if (process.env.MOCK_RESEARCH === "1") {
     return buildMockResearch(cve, generatedAt);
@@ -568,6 +678,7 @@ async function researchCve(cve) {
     sourceTask("kev", () => fetchKev(cve)),
     sourceTask("github", () => fetchGitHubRepos(cve)),
     sourceTask("githubIssues", () => fetchGitHubIssues(cve)),
+    sourceTask("githubAdvisories", () => fetchGitHubAdvisories(cve)),
     sourceTask("hackerNews", () => fetchHackerNews(cve)),
     sourceTask("reddit", () => fetchReddit(cve)),
     sourceTask("vulncheck", () => fetchVulnCheck(cve))
@@ -581,6 +692,7 @@ async function researchCve(cve) {
   const kev = sources.kev.data || null;
   const github = sources.github.data || null;
   const githubIssues = sources.githubIssues.data || null;
+  const githubAdvisories = sources.githubAdvisories.data || null;
   const hackerNews = sources.hackerNews.data || null;
   const reddit = sources.reddit.data || null;
   const vulncheck = sources.vulncheck.data || null;
@@ -593,9 +705,10 @@ async function researchCve(cve) {
   const references = dedupeByUrl([
     ...extractNvdReferences(nvd),
     ...extractCveOrgReferences(cveOrg),
-    ...extractKevReferences(kev)
+    ...extractKevReferences(kev),
+    ...extractGitHubAdvisoryReferences(githubAdvisories)
   ]);
-  const evidence = enrichEvidenceConfidence(buildEvidence(cve, { nvd, cveOrg, epss, kev, github, githubIssues, hackerNews, reddit, vulncheck, references }));
+  const evidence = enrichEvidenceConfidence(buildEvidence(cve, { nvd, cveOrg, epss, kev, github, githubIssues, githubAdvisories, hackerNews, reddit, vulncheck, references }));
   const timeline = buildTimeline({ nvd, cveOrg, epss, kev, github, githubIssues, hackerNews, reddit, vulncheck, references });
   const remediation = buildRemediation(cve, { kev, references, affected, title, cvss });
   const realWorld = buildRealWorldAssessment(cve, { cvss, epss, kev, github, githubIssues, hackerNews, reddit, vulncheck, references, evidence });
@@ -639,6 +752,7 @@ async function researchCve(cve) {
       kev: kev ? summarizeKev(kev) : null,
       github: github ? summarizeGithub(github) : null,
       githubIssues: githubIssues ? summarizeGithubIssues(githubIssues) : null,
+      githubAdvisories: githubAdvisories ? summarizeGithubAdvisories(githubAdvisories) : null,
       hackerNews: hackerNews ? summarizeHackerNews(hackerNews) : null,
       reddit: reddit ? summarizeReddit(reddit) : null,
       realWorld,
@@ -789,7 +903,7 @@ async function sourceTask(id, fn) {
   const started = Date.now();
   try {
     const data = await fn();
-    return {
+    const result = {
       id,
       label: source?.label || id,
       status: data?.skipped ? "skipped" : "ok",
@@ -798,8 +912,10 @@ async function sourceTask(id, fn) {
       url: source?.url || "",
       data: data?.skipped ? null : data
     };
+    recordSourceTelemetry(result);
+    return result;
   } catch (error) {
-    return {
+    const result = {
       id,
       label: source?.label || id,
       status: "error",
@@ -808,7 +924,18 @@ async function sourceTask(id, fn) {
       url: source?.url || "",
       data: null
     };
+    recordSourceTelemetry(result);
+    return result;
   }
+}
+
+function recordSourceTelemetry(result) {
+  sourceTelemetry.set(result.id, {
+    status: result.status,
+    message: result.message,
+    latencyMs: result.latencyMs,
+    lastCheckedAt: new Date().toISOString()
+  });
 }
 
 async function fetchNvd(cve) {
@@ -959,6 +1086,41 @@ async function fetchGitHubIssues(cve) {
   };
 }
 
+async function fetchGitHubAdvisories(cve) {
+  const headers = {
+    accept: "application/vnd.github+json",
+    "x-github-api-version": "2022-11-28",
+    "user-agent": "VulnScope/0.2"
+  };
+  if (process.env.GITHUB_TOKEN) {
+    headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+  const url = `https://api.github.com/advisories?cve_id=${encodeURIComponent(cve)}&per_page=10`;
+  const json = await fetchJson(url, { headers });
+  const items = Array.isArray(json) ? json : [];
+  return {
+    totalCount: items.length,
+    items: items.map((item) => ({
+      id: item.ghsa_id || item.cve_id || cve,
+      cve: item.cve_id || cve,
+      severity: item.severity || "unknown",
+      summary: item.summary || "",
+      description: item.description || "",
+      publishedAt: item.published_at || null,
+      updatedAt: item.updated_at || null,
+      withdrawnAt: item.withdrawn_at || null,
+      url: item.html_url || `https://github.com/advisories/${item.ghsa_id}`,
+      references: (item.references || []).map((reference) => reference.url).filter(Boolean),
+      vulnerabilities: (item.vulnerabilities || []).map((vulnerability) => ({
+        ecosystem: vulnerability.package?.ecosystem || "",
+        package: vulnerability.package?.name || "",
+        vulnerableRange: vulnerability.vulnerable_version_range || "",
+        firstPatchedVersion: vulnerability.first_patched_version || null
+      }))
+    }))
+  };
+}
+
 async function fetchHackerNews(cve) {
   const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(cve)}&hitsPerPage=10`;
   const json = await fetchJson(url, {
@@ -1068,6 +1230,169 @@ function unwrapVulnCheckResult(result) {
     return result.value.data;
   }
   return result.value;
+}
+
+function normalizeEnrichmentPackages(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const packages = [];
+  for (const item of value.slice(0, enrichmentPackageMax)) {
+    if (!item || typeof item !== "object") continue;
+    const purl = boundedString(item.purl, 1000);
+    const ecosystem = boundedString(item.ecosystem, 80);
+    const name = boundedString(item.name, 300);
+    const version = boundedString(item.version, 200);
+    const validPurl = /^pkg:[a-z0-9.+-]+\/[a-z0-9._~!$&'()*+,;=:@%/-]+/i.test(purl) ? purl : "";
+    if (!validPurl && (!ecosystem || !name || !version)) continue;
+    const key = validPurl || `${ecosystem}:${name}@${version}`;
+    if (seen.has(key.toLowerCase())) continue;
+    seen.add(key.toLowerCase());
+    packages.push({
+      key,
+      purl: validPurl,
+      ecosystem,
+      name,
+      version,
+      fileName: boundedString(item.fileName, 300)
+    });
+  }
+  return packages;
+}
+
+function boundedString(value, maxLength) {
+  return String(value || "").trim().slice(0, maxLength);
+}
+
+async function enrichPackages(packages) {
+  const generatedAt = new Date().toISOString();
+  const source = await sourceTask("osv", () => fetchOsvPackageMatches(packages));
+  return {
+    generatedAt,
+    packageCount: packages.length,
+    vulnerabilityCount: source.data?.vulnerabilityCount || 0,
+    truncated: Boolean(source.data?.truncated),
+    packages: source.data?.packages || packages.map((pkg) => ({ ...pkg, vulnerabilities: [] })),
+    sourceResults: [{
+      id: source.id,
+      label: source.label,
+      status: source.status,
+      message: source.message,
+      latencyMs: source.latencyMs,
+      url: source.url
+    }]
+  };
+}
+
+async function fetchOsvPackageMatches(packages) {
+  const queries = packages.map((pkg) => {
+    if (pkg.purl) return {
+      ...(pkg.version ? { version: pkg.version } : {}),
+      package: { purl: pkg.purl }
+    };
+    return {
+      version: pkg.version,
+      package: {
+        ecosystem: pkg.ecosystem,
+        name: pkg.name
+      }
+    };
+  });
+  const batch = await fetchJson("https://api.osv.dev/v1/querybatch", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "user-agent": "VulnScope/0.2"
+    },
+    body: JSON.stringify({ queries })
+  });
+  if (!Array.isArray(batch?.results) || batch.results.length !== packages.length) {
+    throw new Error("No OSV package results returned.");
+  }
+
+  const ids = [...new Set(batch.results.flatMap((result) => (result?.vulns || []).map((vulnerability) => vulnerability.id).filter(Boolean)))];
+  const selectedIds = ids.slice(0, enrichmentVulnerabilityMax);
+  const detailRows = [];
+  for (let index = 0; index < selectedIds.length; index += outboundConcurrency) {
+    const group = selectedIds.slice(index, index + outboundConcurrency);
+    detailRows.push(...await Promise.all(group.map(async (id) => {
+      try {
+        return [id, await fetchJson(`https://api.osv.dev/v1/vulns/${encodeURIComponent(id)}`, {
+          headers: { accept: "application/json", "user-agent": "VulnScope/0.2" }
+        })];
+      } catch {
+        return [id, null];
+      }
+    })));
+  }
+  const details = new Map(detailRows);
+  const enriched = packages.map((pkg, index) => ({
+    ...pkg,
+    vulnerabilities: (batch.results[index]?.vulns || [])
+      .filter((item) => selectedIds.includes(item.id))
+      .map((item) => normalizeOsvVulnerability(details.get(item.id), item))
+  }));
+  return {
+    packages: enriched,
+    vulnerabilityCount: new Set(enriched.flatMap((pkg) => pkg.vulnerabilities.map((item) => item.id))).size,
+    truncated: ids.length > selectedIds.length,
+    message: `Matched ${ids.length} OSV record${ids.length === 1 ? "" : "s"} across ${packages.length} package${packages.length === 1 ? "" : "s"}.`
+  };
+}
+
+function normalizeOsvVulnerability(detail, fallback = {}) {
+  const affected = (Array.isArray(detail?.affected) ? detail.affected : []).slice(0, 12);
+  const aliases = (Array.isArray(detail?.aliases) ? detail.aliases : []).slice(0, 50).map((value) => boundedString(value, 120));
+  const cves = aliases.filter((value) => /^CVE-\d{4}-\d{4,}$/i.test(value));
+  const fixedVersions = [...new Set(affected.flatMap((entry) => (entry.ranges || [])
+    .slice(0, 8)
+    .flatMap((range) => (range.events || []).slice(0, 50).map((event) => boundedString(event.fixed, 200)).filter(Boolean))))].slice(0, 100);
+  return {
+    id: boundedString(detail?.id || fallback.id || "Unknown", 120),
+    aliases,
+    cves,
+    summary: boundedString(detail?.summary, 1000),
+    details: boundedString(detail?.details, 4000),
+    severity: boundedString(detail?.database_specific?.severity, 40),
+    published: detail?.published || null,
+    modified: detail?.modified || fallback.modified || null,
+    withdrawn: detail?.withdrawn || null,
+    fixedVersions,
+    affected: affected.map(normalizeOsvAffectedEntry),
+    references: (detail?.references || []).slice(0, 50).map((reference) => ({
+      type: boundedString(reference.type || "WEB", 40),
+      url: safeHttpUrl(reference.url)
+    })).filter((reference) => reference.url)
+  };
+}
+
+function normalizeOsvAffectedEntry(entry) {
+  return {
+    package: {
+      ecosystem: boundedString(entry?.package?.ecosystem, 80),
+      name: boundedString(entry?.package?.name, 300),
+      purl: boundedString(entry?.package?.purl, 1000)
+    },
+    ranges: (entry?.ranges || []).slice(0, 8).map((range) => ({
+      type: boundedString(range?.type, 40),
+      repo: safeHttpUrl(range?.repo),
+      events: (range?.events || []).slice(0, 50).map((event) => Object.fromEntries(
+        ["introduced", "fixed", "last_affected", "limit"]
+          .filter((key) => event?.[key] !== undefined)
+          .map((key) => [key, boundedString(event[key], 200)])
+      ))
+    })),
+    versions: (entry?.versions || []).slice(0, 100).map((value) => boundedString(value, 200))
+  };
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch {
+    return "";
+  }
 }
 
 async function fetchJson(url, options = {}) {
@@ -1305,6 +1630,25 @@ function extractKevReferences(kev) {
   }));
 }
 
+function extractGitHubAdvisoryReferences(advisories) {
+  return (advisories?.items || []).flatMap((advisory) => [
+    {
+      url: advisory.url,
+      title: advisory.summary || advisory.id,
+      source: "GitHub Advisory Database",
+      tags: ["GitHub Advisory", advisory.severity].filter(Boolean),
+      type: "advisory"
+    },
+    ...(advisory.references || []).map((url) => ({
+      url,
+      title: url,
+      source: "GitHub Advisory Database",
+      tags: ["GitHub Advisory"],
+      type: classifyReference(url, ["GitHub Advisory"])
+    }))
+  ]);
+}
+
 function classifyReference(url = "", tags = []) {
   const joined = `${tags.join(" ")} ${url}`.toLowerCase();
   if (/patch|release|update|fixed|commit|pull/.test(joined)) return "patch";
@@ -1328,7 +1672,7 @@ function dedupeByUrl(items) {
 
 function buildEvidence(cve, context) {
   const evidence = [];
-  const { nvd, cveOrg, epss, kev, github, githubIssues, hackerNews, reddit, vulncheck, references } = context;
+  const { nvd, cveOrg, epss, kev, github, githubIssues, githubAdvisories, hackerNews, reddit, vulncheck, references } = context;
 
   if (nvd) {
     evidence.push({
@@ -1428,6 +1772,22 @@ function buildEvidence(cve, context) {
     });
   }
 
+  for (const advisory of githubAdvisories?.items || []) {
+    evidence.push({
+      id: `github-advisory-${advisory.id}`,
+      type: "primary-record",
+      source: "GitHub Advisory Database",
+      title: advisory.summary || advisory.id,
+      url: advisory.url,
+      description: advisory.withdrawnAt
+        ? `Withdrawn advisory. ${advisory.description || "Review the advisory history before using it."}`
+        : advisory.description || `${advisory.vulnerabilities.length} affected package range record${advisory.vulnerabilities.length === 1 ? "" : "s"}.`,
+      date: advisory.updatedAt || advisory.publishedAt,
+      confidence: "high",
+      tags: [advisory.id, advisory.severity, advisory.withdrawnAt ? "withdrawn" : "reviewed"].filter(Boolean)
+    });
+  }
+
   for (const item of hackerNews?.items || []) {
     evidence.push({
       id: `hn-${item.id}`,
@@ -1522,6 +1882,13 @@ function sourceReputationForEvidence(item) {
       tier: "CNA record",
       trust: "confirmed",
       guidance: "Primary CVE program record from the CNA or CVE Services."
+    };
+  }
+  if (source.includes("github advisory")) {
+    return {
+      tier: "Reviewed package advisory",
+      trust: "confirmed",
+      guidance: "Reviewed package advisory data with affected-version and patch-range context."
     };
   }
   if (source.includes("first epss")) {
@@ -2528,6 +2895,7 @@ function buildSourceLinks(cve) {
     { label: "FIRST EPSS", url: `https://api.first.org/data/v1/epss?cve=${encoded}` },
     { label: "GitHub Search", url: `https://github.com/search?q=${encoded}&type=repositories` },
     { label: "GitHub Issues/PRs", url: `https://github.com/search?q=${encoded}&type=issues` },
+    { label: "GitHub Advisory Database", url: `https://github.com/advisories?query=${encoded}` },
     { label: "Hacker News", url: `https://hn.algolia.com/?q=${encoded}` },
     { label: "Reddit Search", url: `https://www.reddit.com/search/?q=${encoded}` },
     { label: "Exploit-DB Search", url: `https://www.exploit-db.com/search?cve=${encoded.replace("CVE-", "")}` },
@@ -2575,6 +2943,15 @@ function summarizeGithubIssues(githubIssues) {
     totalCount: githubIssues.totalCount || 0,
     incomplete: Boolean(githubIssues.incomplete),
     topItems: (githubIssues.items || []).slice(0, 5)
+  };
+}
+
+function summarizeGithubAdvisories(githubAdvisories) {
+  return {
+    totalCount: githubAdvisories?.totalCount || 0,
+    reviewed: (githubAdvisories?.items || []).filter((item) => !item.withdrawnAt).length,
+    withdrawn: (githubAdvisories?.items || []).filter((item) => item.withdrawnAt).length,
+    packages: (githubAdvisories?.items || []).reduce((count, item) => count + (item.vulnerabilities?.length || 0), 0)
   };
 }
 

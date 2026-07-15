@@ -17,6 +17,24 @@
           </div>
         </div>
 
+        <nav class="sidebar-section workspace-launcher" aria-label="Vulnerability workspaces">
+          <h2>Workspaces</h2>
+          <button class="workspace-button" type="button" data-action="open-exposures">
+            <strong>Exposure workspace</strong>
+            <span>Prioritize packages and assets</span>
+          </button>
+          <button class="workspace-button" type="button" data-action="open-bulk">
+            <strong>Bulk CVE research</strong>
+            <span>Queue a list of CVEs</span>
+          </button>
+          <label class="workspace-button workspace-upload" for="evidenceInput">
+            <strong>Import cloud or VEX evidence</strong>
+            <span>AWS Inspector, Defender, OpenVEX, CSAF</span>
+          </label>
+          <input id="evidenceInput" class="sr-only" type="file" multiple accept=".json,.csv,.txt,application/json,text/csv,text/plain">
+          <div id="evidenceList" class="case-list" aria-live="polite"></div>
+        </nav>
+
         <div class="sidebar-section">
           <label class="field-label" for="caseFilter">Saved cases</label>
           <input id="caseFilter" class="input" type="search" placeholder="Filter case files">
@@ -26,7 +44,7 @@
         <div class="sidebar-section">
           <div class="section-heading">
             <h2>SBOM Uploads</h2>
-            <button id="sbomClear" class="icon-button" type="button" title="Clear SBOM uploads" aria-label="Clear SBOM uploads">C</button>
+            <button id="sbomClear" class="compact-button" type="button" title="Clear SBOM uploads">Clear</button>
           </div>
           <label class="upload-button" for="sbomInput">Upload SBOM</label>
           <input id="sbomInput" class="sr-only" type="file" multiple accept=".json,.xml,.spdx,.cdx,.bom,.txt,application/json,application/xml,text/xml,text/plain">
@@ -36,7 +54,7 @@
         <div class="sidebar-section">
           <div class="section-heading">
             <h2>Watchlist</h2>
-            <button id="watchRefreshAll" class="icon-button" type="button" title="Refresh watchlist" aria-label="Refresh watchlist">W</button>
+            <button id="watchRefreshAll" class="compact-button" type="button" title="Refresh watchlist">Refresh</button>
           </div>
           <div id="watchList" class="case-list" aria-live="polite"></div>
         </div>
@@ -44,7 +62,7 @@
         <div class="sidebar-section source-panel">
           <div class="section-heading">
             <h2>Source Health</h2>
-            <button id="healthRefresh" class="icon-button" type="button" title="Refresh source health" aria-label="Refresh source health">R</button>
+            <button id="healthRefresh" class="compact-button" type="button" title="Refresh source status">Refresh</button>
           </div>
           <div id="sourceHealth" class="source-list"></div>
         </div>
@@ -85,6 +103,8 @@
           <p>VulnScope will query public vulnerability sources, synthesize risk signals, collect references, and keep the work in a local case file.</p>
           <div class="empty-actions">
             <label class="primary-button" for="sbomInput">Upload SBOM Files</label>
+            <button class="secondary-button" type="button" data-action="open-exposures">Open Exposure Workspace</button>
+            <button class="secondary-button" type="button" data-action="open-bulk">Bulk CVE Research</button>
           </div>
         </div>
       </div>

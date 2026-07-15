@@ -13,6 +13,20 @@ Parameters:
     Type: String
   LambdaCodeKey:
     Type: String
+  NotificationEmail:
+    Type: String
+    Default: ""
+  MonitoredCves:
+    Type: String
+    Default: ""
+  MonitorScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+
+Conditions:
+  EnableScheduledMonitor: !And
+    - !Not [!Equals [!Ref NotificationEmail, ""]]
+    - !Not [!Equals [!Ref MonitoredCves, ""]]
 
 Resources:
   StaticBucket:
@@ -27,6 +41,18 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldStaticVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
 
   ApiFunctionRole:
     Type: AWS::IAM::Role
@@ -62,6 +88,7 @@ Resources:
         - arm64
       MemorySize: 512
       Timeout: 20
+      ReservedConcurrentExecutions: 2
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !Ref LambdaCodeKey
@@ -77,7 +104,120 @@ Resources:
           OUTBOUND_QUEUE_MAX: "50"
           CACHE_MAX_ENTRIES: "300"
           RESPONSE_MAX_BYTES: "8388608"
-          TRUST_PROXY: "1"
+          API_BODY_MAX_BYTES: "262144"
+          ENRICHMENT_PACKAGE_MAX: "200"
+          ENRICHMENT_VULNERABILITY_MAX: "120"
+
+  MonitorTable:
+    Type: AWS::DynamoDB::Table
+    Condition: EnableScheduledMonitor
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cve
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cve
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  MonitorTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableScheduledMonitor
+    Properties:
+      DisplayName: VulnScope CVE monitor
+
+  MonitorEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableScheduledMonitor
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref MonitorTopic
+
+  MonitorFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableScheduledMonitor
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: monitor-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt MonitorTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref MonitorTopic
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableScheduledMonitor
+    Properties:
+      FunctionName: vulnscope-monitor
+      Description: Refreshes deployment-configured CVEs and sends material-change notifications.
+      Runtime: nodejs22.x
+      Handler: monitor.handler
+      Role: !GetAtt MonitorFunctionRole.Arn
+      Architectures:
+        - arm64
+      MemorySize: 512
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          NODE_ENV: production
+          MONITORED_CVES: !Ref MonitoredCves
+          MONITOR_TABLE_NAME: !Ref MonitorTable
+          MONITOR_TOPIC_ARN: !Ref MonitorTopic
+          RESEARCH_CONCURRENCY: "2"
+          RESEARCH_QUEUE_MAX: "5"
+          OUTBOUND_CONCURRENCY: "6"
+          OUTBOUND_QUEUE_MAX: "40"
+          RESPONSE_MAX_BYTES: "8388608"
+
+  MonitorSchedule:
+    Type: AWS::Events::Rule
+    Condition: EnableScheduledMonitor
+    Properties:
+      Description: Daily VulnScope monitored CVE refresh.
+      ScheduleExpression: !Ref MonitorScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonitorFunction.Arn
+          Id: VulnScopeMonitor
+
+  MonitorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableScheduledMonitor
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MonitorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonitorSchedule.Arn
 
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
@@ -93,11 +233,25 @@ Resources:
       IntegrationUri: !GetAtt ApiFunction.Arn
       PayloadFormatVersion: "2.0"
 
-  HttpApiRoute:
+  HttpApiHealthRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApi
-      RouteKey: ANY /api/{proxy+}
+      RouteKey: GET /api/health
+      Target: !Sub integrations/${HttpApiIntegration}
+
+  HttpApiResearchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/research
+      Target: !Sub integrations/${HttpApiIntegration}
+
+  HttpApiEnrichRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /api/enrich
       Target: !Sub integrations/${HttpApiIntegration}
 
   HttpApiStage:
@@ -106,6 +260,9 @@ Resources:
       ApiId: !Ref HttpApi
       StageName: $default
       AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
 
   ApiInvokePermission:
     Type: AWS::Lambda::Permission
@@ -213,10 +370,7 @@ Resources:
               - GET
               - HEAD
               - OPTIONS
-              - PUT
               - POST
-              - PATCH
-              - DELETE
             CachedMethods:
               - GET
               - HEAD
@@ -276,3 +430,6 @@ Outputs:
     Value: !Ref Distribution
   DistributionDomainName:
     Value: !GetAtt Distribution.DomainName
+  MonitorTopicArn:
+    Condition: EnableScheduledMonitor
+    Value: !Ref MonitorTopic
