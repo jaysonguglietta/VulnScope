@@ -116,6 +116,8 @@ Production exposes only:
 - `GET /api/research?cve=CVE-YYYY-NNNN[&refresh=1]`
 - `POST /api/enrich`
 
+CloudFront requires its full seven-method origin behavior whenever `POST` is enabled. The effective application allowlist is the three explicit API Gateway routes above; `PUT`, `PATCH`, `DELETE`, and unknown paths have no API Gateway route and do not invoke the Lambda.
+
 The enrichment request is JSON and accepts no more than 200 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 120 per request, and upstream responses are capped at 8 MiB.
 
 API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.

@@ -370,7 +370,12 @@ Resources:
               - GET
               - HEAD
               - OPTIONS
+              # CloudFront requires the full method group when POST is enabled.
+              # API Gateway's explicit routes remain the application allowlist.
+              - PUT
               - POST
+              - PATCH
+              - DELETE
             CachedMethods:
               - GET
               - HEAD
