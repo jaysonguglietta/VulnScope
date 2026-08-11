@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { parseSbomPayload } from "../public/modules/sbom-worker-core.js";
 import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "../public/modules/workspace.js";
+import { csvCell, neutralizeSpreadsheetFormula } from "../public/modules/csv.js";
+
+for (const prefix of ["=", "+", "-", "@", "\t", "\r", "  ="]) {
+  assert.equal(neutralizeSpreadsheetFormula(`${prefix}formula`).startsWith("'"), true, `CSV prefix ${JSON.stringify(prefix)} must be neutralized`);
+}
+assert.equal(csvCell("=1+1"), "'=1+1");
+assert.equal(csvCell("value,with,commas"), '"value,with,commas"');
+assert.equal(csvCell('value "quoted"'), '"value ""quoted"""');
+assert.equal(csvCell(-1), "-1", "real numeric values must remain numeric");
+assert.equal(csvCell(true), "true", "boolean values must remain typed literals");
 
 const sampleText = await readFile(new URL("fixtures/sample-cyclonedx.json", import.meta.url), "utf8");
 const result = parseSbomPayload({ name: "sample-cyclonedx.json", size: sampleText.length }, sampleText);
