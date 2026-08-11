@@ -228,6 +228,9 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
           assetName: report.title,
           assetType: "SBOM",
           vexStatus: entry.vexStatus,
+          vexTrusted: Boolean(entry.vex?.trusted),
+          vexClaimedStatus: entry.vexStatus,
+          vexTrustReason: entry.vex?.trustReason || "Embedded SBOM VEX is unverified.",
           summary: entry.vex?.detail || entry.vex?.justification || ""
         }));
       }
@@ -264,9 +267,16 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
   const deduped = dedupeExposures(rows).map((row) => {
     const investigation = investigationMap.get(row.vulnerability);
     const vex = bestVexStatement(row, vexStatements);
+    const claimedVexStatus = vex?.status || row.vexClaimedStatus || row.vexStatus || "Unreviewed";
+    const vexTrusted = vex ? Boolean(vex.trusted) : Boolean(row.vexTrusted);
+    const suppressiveVex = ["Not affected", "Fixed"].includes(claimedVexStatus);
     const enriched = {
       ...row,
-      vexStatus: vex?.status || row.vexStatus || "Unreviewed",
+      vexStatus: suppressiveVex && !vexTrusted ? "Needs verification" : claimedVexStatus,
+      vexClaimedStatus: claimedVexStatus,
+      vexTrusted,
+      vexTrustReason: vex?.trustReason || row.vexTrustReason || "No trusted VEX decision is available.",
+      vexMatchedProducts: vex?.products || [],
       vexJustification: vex?.justification || vex?.impact || "",
       vexAction: vex?.action || "",
       kev: Boolean(investigation?.metrics?.kev?.listed || row.kev),
@@ -311,7 +321,10 @@ function normalizeVexStatement(value) {
     action: String(value.action || ""),
     detail: String(value.detail || ""),
     timestamp: value.timestamp || null,
-    source: value.source || "VEX"
+    source: value.source || "VEX",
+    trusted: Boolean(value.trusted),
+    approvedAt: value.approvedAt || null,
+    trustReason: String(value.trustReason || "Imported VEX is unverified.")
   };
 }
 
@@ -346,6 +359,9 @@ function normalizeExposure(value) {
     workflowStatus: String(value.workflowStatus || value.status || "Needs triage"),
     owner: String(value.owner || ""),
     vexStatus: normalizeVexStatus(value.vexStatus || ""),
+    vexClaimedStatus: normalizeVexStatus(value.vexClaimedStatus || value.vexStatus || ""),
+    vexTrusted: Boolean(value.vexTrusted),
+    vexTrustReason: String(value.vexTrustReason || ""),
     references: arrayValue(value.references)
   };
 }
@@ -395,9 +411,9 @@ function bestVexStatement(row, statements) {
   const matched = candidates.find((statement) => statement.products.some((item) => {
     const product = normalizeProductIdentity(item);
     if (product.length < 3) return false;
-    return rowProducts.some((value) => value === product || value.includes(product) || product.includes(value));
+    return rowProducts.some((value) => value === product);
   }));
-  return matched || candidates.find((statement) => !statement.products.length);
+  return matched;
 }
 
 function exposurePriority(row) {

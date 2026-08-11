@@ -195,6 +195,8 @@ Supported cloud and VEX inputs:
 - CSAF VEX
 - CycloneDX VEX
 
+VEX is treated as unverified input. `Not affected` and `Fixed` claims apply only after the analyst approves them during import and only when the statement product exactly matches a package URL, package name, asset ID, or asset name. Ambiguous substring and productless matches never suppress an exposure.
+
 Browser safety limits are 10 files per batch, 10 MiB per file, 40 MiB total, and 100,000 normalized parser records. JSON and text parsing runs in a Web Worker; XML uses the browser DOM parser fallback.
 
 ## Local and Container Runs
