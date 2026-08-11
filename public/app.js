@@ -1,4 +1,5 @@
 import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "./modules/workspace.js";
+import { csvCell } from "./modules/csv.js";
 
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
@@ -948,11 +949,6 @@ function exportExposureCsv() {
   const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Claimed Status", "VEX Trust", "VEX Justification", "Owner", "Workflow Status"];
   const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexClaimedStatus, row.vexTrusted ? row.vexTrustReason : `Unverified: ${row.vexTrustReason}`, row.vexJustification, row.owner, row.workflowStatus]);
   download("vulnscope-exposure-register.csv", [headers, ...values].map((record) => record.map(csvCell).join(",")).join("\n"), "text/csv");
-}
-
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function openBulkWorkspace() {
