@@ -10,10 +10,43 @@ ROOT_DOMAIN="${ROOT_DOMAIN:-jsontechnology.com}"
 NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
 MONITORED_CVES="${MONITORED_CVES:-}"
 MONITOR_SCHEDULE="${MONITOR_SCHEDULE:-rate(1 day)}"
+LAMBDA_ARTIFACT_PATH="${LAMBDA_ARTIFACT_PATH:-}"
+LAMBDA_ARTIFACT_SHA256="${LAMBDA_ARTIFACT_SHA256:-}"
+ALLOW_LOCAL_UNSIGNED_BUILD="${ALLOW_LOCAL_UNSIGNED_BUILD:-0}"
+BUILD_DIR=".deploy/lambda"
 export AWS_PROFILE
 
 if [[ "${REGION}" != "us-east-1" ]]; then
   echo "VulnScope CloudFront ACM certificates must be deployed from us-east-1." >&2
+  exit 1
+fi
+
+rm -rf ".deploy"
+mkdir -p "${BUILD_DIR}"
+if [[ -n "${LAMBDA_ARTIFACT_PATH}" ]]; then
+  if [[ -z "${LAMBDA_ARTIFACT_SHA256}" ]]; then
+    echo "LAMBDA_ARTIFACT_SHA256 is required with LAMBDA_ARTIFACT_PATH." >&2
+    exit 1
+  fi
+  ACTUAL_ARTIFACT_SHA256="$(shasum -a 256 "${LAMBDA_ARTIFACT_PATH}" | awk '{print $1}')"
+  if [[ "${ACTUAL_ARTIFACT_SHA256}" != "${LAMBDA_ARTIFACT_SHA256}" ]]; then
+    echo "Lambda artifact checksum mismatch." >&2
+    exit 1
+  fi
+  gh attestation verify "${LAMBDA_ARTIFACT_PATH}" \
+    --repo jaysonguglietta/VulnScope \
+    --signer-workflow jaysonguglietta/VulnScope/.github/workflows/release.yml \
+    --deny-self-hosted-runners >/dev/null
+  cp "${LAMBDA_ARTIFACT_PATH}" ".deploy/lambda.zip"
+elif [[ "${ALLOW_LOCAL_UNSIGNED_BUILD}" == "1" ]]; then
+  echo "WARNING: deploying an unsigned local build through the explicit break-glass path." >&2
+  cp server.mjs lambda.mjs monitor.mjs package.json package-lock.json "${BUILD_DIR}/"
+  (cd "${BUILD_DIR}" && npm ci --omit=dev --ignore-scripts >/dev/null)
+  (cd "${BUILD_DIR}" && zip -qr "../lambda.zip" .)
+else
+  echo "Refusing an unsigned production build." >&2
+  echo "Provide LAMBDA_ARTIFACT_PATH and LAMBDA_ARTIFACT_SHA256 from the GitHub release workflow." >&2
+  echo "Set ALLOW_LOCAL_UNSIGNED_BUILD=1 only for an intentional emergency build." >&2
   exit 1
 fi
 
@@ -42,7 +75,6 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-vulnscope-artifacts-${ACCOUNT_ID}-${REGION}}
 STATIC_BUCKET="${STATIC_BUCKET:-${DOMAIN_BUCKET_PART}-${ACCOUNT_ID}}"
 BUILD_ID="$(date -u +%Y%m%d%H%M%S)"
 LAMBDA_CODE_KEY="lambda/vulnscope-${BUILD_ID}.zip"
-BUILD_DIR=".deploy/lambda"
 
 echo "Deploying VulnScope"
 echo "  profile: ${AWS_PROFILE}"
@@ -61,12 +93,6 @@ fi
 aws s3api put-bucket-encryption \
   --bucket "${ARTIFACT_BUCKET}" \
   --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null
-
-rm -rf ".deploy"
-mkdir -p "${BUILD_DIR}"
-cp server.mjs lambda.mjs monitor.mjs package.json package-lock.json "${BUILD_DIR}/"
-(cd "${BUILD_DIR}" && npm ci --omit=dev --ignore-scripts >/dev/null)
-(cd "${BUILD_DIR}" && zip -qr "../lambda.zip" .)
 
 aws s3 cp ".deploy/lambda.zip" "s3://${ARTIFACT_BUCKET}/${LAMBDA_CODE_KEY}" >/dev/null
 

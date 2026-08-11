@@ -22,6 +22,7 @@ Do not place private source tokens in the browser bundle, commit them to Git, or
 - Static and artifact buckets block public access and use server-side encryption. The static bucket uses versioning with noncurrent-version cleanup.
 - Scheduled-monitor state is encrypted in DynamoDB and expires after 180 days.
 - Production dependencies are checked with `npm audit --omit=dev` in `npm run verify`.
+- Release actions and the production container base are immutable; release bundles include a checksum, SPDX SBOM, and GitHub-signed provenance that the deployment script verifies.
 
 ## Intentional Omissions
 

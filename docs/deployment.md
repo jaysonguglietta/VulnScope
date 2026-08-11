@@ -51,8 +51,23 @@ From the repository root:
 
 ```bash
 npm run verify
+```
+
+Run the GitHub `Release artifact` workflow for the desired commit. Download its `vulnscope-<commit>` artifact, verify the attestation, and deploy the extracted Lambda ZIP with its recorded checksum:
+
+```bash
+gh attestation verify ./release/lambda.zip \
+  --repo jaysonguglietta/VulnScope \
+  --signer-workflow jaysonguglietta/VulnScope/.github/workflows/release.yml \
+  --deny-self-hosted-runners
+LAMBDA_ARTIFACT_PATH=./release/lambda.zip \
+LAMBDA_ARTIFACT_SHA256=$(shasum -a 256 ./release/lambda.zip | awk '{print $1}') \
 npm run deploy:aws
 ```
+
+The workflow pins every action by commit SHA, builds with `npm ci`, verifies npm registry signatures, generates an SPDX JSON SBOM, records a SHA-256 checksum, and creates GitHub-signed provenance for both the Lambda ZIP and SBOM. The Docker base is pinned to the immutable multi-platform digest corresponding to `node:22-alpine`.
+
+Unsigned local builds are refused by default. `ALLOW_LOCAL_UNSIGNED_BUILD=1 npm run deploy:aws` is an explicit emergency break-glass path and should be documented in the change record when used.
 
 Defaults:
 
@@ -71,7 +86,7 @@ The script:
 
 1. Resolves the AWS account and public Route 53 hosted zone.
 2. Creates or reuses the private artifact bucket and enforces AES-256 server-side encryption.
-3. Packages `server.mjs`, `lambda.mjs`, `monitor.mjs`, production dependencies, and lock files.
+3. Verifies the Lambda artifact checksum and GitHub build attestation.
 4. Uploads the immutable Lambda artifact and deploys `infra/vulnscope.yml`.
 5. Syncs `public/` to the private static bucket and invalidates CloudFront.
 
