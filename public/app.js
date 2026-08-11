@@ -1,4 +1,5 @@
 import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "./modules/workspace.js";
+import { formatSafeDate as formatDate, formatSafeDateTime as formatDateTime } from "./modules/date.js";
 
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
@@ -1840,7 +1841,7 @@ function renderMetrics(item) {
       <div class="metric-card">
         <div class="metric-label">CISA KEV</div>
         <div class="metric-value">${kev?.listed ? "Listed" : "No"}</div>
-        <div class="metric-detail">${kev?.dueDate ? `Due ${formatDate(kev.dueDate)}` : "Current catalog check"}</div>
+        <div class="metric-detail">${kev?.dueDate ? `Due ${escapeHtml(formatDate(kev.dueDate))}` : "Current catalog check"}</div>
       </div>
       <div class="metric-card">
         <div class="metric-label">Chatter</div>
@@ -2257,7 +2258,7 @@ function renderEvidenceCard(entry) {
         <h3>${escapeHtml(entry.title)}</h3>
         <p>${escapeHtml(entry.description || "No description supplied by this source.")}</p>
         <div class="evidence-meta">
-          ${entry.date ? `<span class="badge">${formatDate(entry.date)}</span>` : ""}
+          ${entry.date ? `<span class="badge">${escapeHtml(formatDate(entry.date))}</span>` : ""}
           ${(entry.tags || []).slice(0, 6).map((tag) => `<span class="badge">${escapeHtml(tag)}</span>`).join("")}
         </div>
       </div>
@@ -2276,7 +2277,7 @@ function renderTimeline(item) {
                 .map(
                   (event) => `
                     <div class="timeline-item">
-                      <div class="timeline-date">${event.date ? formatDate(event.date) : "Undated"}</div>
+                      <div class="timeline-date">${event.date ? escapeHtml(formatDate(event.date)) : "Undated"}</div>
                       <div>
                         <strong>${escapeHtml(event.label)}</strong>
                         <p>${escapeHtml(event.source)}${event.detail ? ` - ${escapeHtml(event.detail)}` : ""}</p>
@@ -2343,7 +2344,7 @@ function renderRemediation(item) {
                 <span class="badge">${escapeHtml(step.priority)}</span>
                 <strong>${escapeHtml(step.title)}</strong>
                 <p>${escapeHtml(step.detail)}</p>
-                ${step.dueDate ? `<p><strong>Due:</strong> ${formatDate(step.dueDate)}</p>` : ""}
+                ${step.dueDate ? `<p><strong>Due:</strong> ${escapeHtml(formatDate(step.dueDate))}</p>` : ""}
               </div>
             `
           )
@@ -2538,8 +2539,8 @@ function renderWatchRecord(record) {
   const latestTime = record.latest?.checkedAt || record.lastCheckedAt;
   return `
     <div class="card-grid">
-      <div class="action-item"><span class="badge">Baseline</span><strong>${formatDateTime(baselineTime)}</strong><p>${escapeHtml(record.baseline?.verdict || "Unknown")} / ${escapeHtml(record.baseline?.maturity || "Unknown")}</p></div>
-      <div class="action-item"><span class="badge">Latest check</span><strong>${formatDateTime(latestTime)}</strong><p>${escapeHtml(record.latest?.verdict || "Unknown")} / ${escapeHtml(record.latest?.maturity || "Unknown")}</p></div>
+      <div class="action-item"><span class="badge">Baseline</span><strong>${escapeHtml(formatDateTime(baselineTime))}</strong><p>${escapeHtml(record.baseline?.verdict || "Unknown")} / ${escapeHtml(record.baseline?.maturity || "Unknown")}</p></div>
+      <div class="action-item"><span class="badge">Latest check</span><strong>${escapeHtml(formatDateTime(latestTime))}</strong><p>${escapeHtml(record.latest?.verdict || "Unknown")} / ${escapeHtml(record.latest?.maturity || "Unknown")}</p></div>
     </div>
     <div class="timeline-list watch-change-list">
       ${changes.length ? changes.map((change) => `<div class="timeline-item"><div class="timeline-date">Changed</div><div><strong>${escapeHtml(change.label)}</strong><p>${escapeHtml(change.before)} -> ${escapeHtml(change.after)}</p></div></div>`).join("") : `<div class="timeline-item"><div class="timeline-date">Stable</div><div><strong>No tracked changes since last refresh</strong><p>KEV, EPSS, exploit maturity, risk, chatter, and evidence counts are unchanged.</p></div></div>`}
@@ -2658,7 +2659,7 @@ function renderSbomList() {
       <div class="case-meta">
         <span>${report.components.length} components</span>
         <span>${report.cves.length} CVEs</span>
-        <span>${formatDate(report.uploadedAt)}</span>
+        <span>${escapeHtml(formatDate(report.uploadedAt))}</span>
       </div>
     </button>
   `).join("");
@@ -2743,7 +2744,7 @@ function renderSbomEnrichment(report) {
     return `<section class="panel enrichment-panel"><div class="panel-title-row"><div><h3>Package vulnerability enrichment</h3><p>Not run. The uploaded file remains local; choosing online enrichment sends only supported package identifiers to OSV.</p></div><span class="badge">Opt-in</span></div></section>`;
   }
   const matchedPackages = enrichment.packages.filter((pkg) => pkg.vulnerabilities?.length).length;
-  return `<section class="panel enrichment-panel found"><div class="panel-title-row"><div><h3>OSV package enrichment</h3><p>${matchedPackages} of ${enrichment.packageCount} queried packages matched ${enrichment.vulnerabilityCount} vulnerability records.${enrichment.truncated ? " Results were capped; split the SBOM for additional detail." : ""}</p></div><span class="badge">${formatDateTime(enrichment.generatedAt)}</span></div></section>`;
+  return `<section class="panel enrichment-panel found"><div class="panel-title-row"><div><h3>OSV package enrichment</h3><p>${matchedPackages} of ${enrichment.packageCount} queried packages matched ${enrichment.vulnerabilityCount} vulnerability records.${enrichment.truncated ? " Results were capped; split the SBOM for additional detail." : ""}</p></div><span class="badge">${escapeHtml(formatDateTime(enrichment.generatedAt))}</span></div></section>`;
 }
 
 function renderSbomWarnings(report) {
@@ -2933,7 +2934,7 @@ function renderCases() {
           <div class="case-meta">
             <span>${escapeHtml(item.riskLevel)} ${item.riskScore}</span>
             <span>${escapeHtml(item.status)}</span>
-            <span>${formatDate(item.savedAt)}</span>
+            <span>${escapeHtml(formatDate(item.savedAt))}</span>
           </div>
         </button>
       `
@@ -3567,35 +3568,6 @@ function safeExternalUrl(value) {
 function formatPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "n/a";
   return `${(Number(value) * 100).toFixed(Number(value) < 0.01 ? 3 : 1)}%`;
-}
-
-function formatDate(value) {
-  if (!value) return "Unknown";
-  const date = parseDisplayDate(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" }).format(date);
-}
-
-function formatDateTime(value) {
-  if (!value) return "Unknown";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit"
-  }).format(date);
-}
-
-function parseDisplayDate(value) {
-  const text = String(value);
-  const dateOnly = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (dateOnly) {
-    return new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]));
-  }
-  return new Date(text);
 }
 
 function evidencePriority(item) {

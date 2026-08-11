@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { parseSbomPayload } from "../public/modules/sbom-worker-core.js";
 import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "../public/modules/workspace.js";
+import { formatSafeDate, formatSafeDateTime } from "../public/modules/date.js";
+
+assert.equal(formatSafeDate("<img src=x onerror=alert(1)>", "en-US"), "Unknown");
+assert.equal(formatSafeDateTime("<script>alert(1)</script>", "en-US"), "Unknown");
+assert.equal(formatSafeDate("2026-08-11", "en-US"), "Aug 11, 2026");
+assert.equal(formatSafeDate("2026-02-31", "en-US"), "Unknown");
+assert.notEqual(formatSafeDateTime("2026-08-11T12:30:00Z", "en-US"), "Unknown");
 
 const sampleText = await readFile(new URL("fixtures/sample-cyclonedx.json", import.meta.url), "utf8");
 const result = parseSbomPayload({ name: "sample-cyclonedx.json", size: sampleText.length }, sampleText);
