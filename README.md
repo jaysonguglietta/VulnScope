@@ -54,6 +54,8 @@ Raw SBOM, cloud finding, and VEX files are parsed locally and retained only in m
 
 OSV enrichment is a separate, explicit action. After confirmation, VulnScope sends only normalized package identifiers, ecosystems, and versions to the server, which queries OSV. Do not enrich package metadata that your policy treats as confidential.
 
+Suppressive VEX claims require an exact product identity match and explicit analyst approval during import. Unapproved `Not affected` and `Fixed` claims remain visible as `Needs verification` and do not lower exposure priority.
+
 Case notes and watchlist entries are stored in browser local storage and pruned after 90 days. Authentication and request logging are intentionally excluded; do not treat this deployment as a shared confidential case-management system.
 
 ## Run Locally

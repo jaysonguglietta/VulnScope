@@ -23,6 +23,7 @@ const openVex = JSON.stringify({
 const vexReport = parseEvidenceFile({ name: "status.openvex.json", size: openVex.length }, openVex);
 assert.equal(vexReport.format, "OpenVEX");
 assert.equal(vexReport.vexStatements[0].status, "Not affected");
+assert.equal(vexReport.vexStatements[0].trusted, false);
 
 const sbomReport = {
   title: "production-api",
@@ -41,9 +42,15 @@ const sbomReport = {
 const exposureRows = buildExposureRows({ sbomReports: [sbomReport], evidenceReports: [vexReport] });
 assert.equal(exposureRows.length, 1);
 assert.equal(exposureRows[0].vulnerability, "CVE-2021-44228");
-assert.equal(exposureRows[0].vexStatus, "Not affected");
-assert.equal(exposureRows[0].priorityScore, 0);
-assert.equal(summarizeExposureRows(exposureRows).notAffected, 1);
+assert.equal(exposureRows[0].vexStatus, "Needs verification");
+assert.notEqual(exposureRows[0].priorityScore, 0);
+assert.equal(summarizeExposureRows(exposureRows).notAffected, 0);
+
+vexReport.vexStatements[0].trusted = true;
+vexReport.vexStatements[0].trustReason = "Analyst approved during import.";
+const approvedExposureRows = buildExposureRows({ sbomReports: [sbomReport], evidenceReports: [vexReport] });
+assert.equal(approvedExposureRows[0].vexStatus, "Not affected");
+assert.equal(approvedExposureRows[0].priorityScore, 0);
 
 const isolatedProducts = buildExposureRows({
   evidenceReports: [{
@@ -56,12 +63,28 @@ const isolatedProducts = buildExposureRows({
       aliases: [],
       products: ["pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"],
       status: "Not affected",
-      justification: "Component is unreachable."
+      justification: "Component is unreachable.",
+      trusted: true,
+      trustReason: "Analyst approved during import."
     }]
   }]
 });
 assert.equal(isolatedProducts.find((row) => row.packageName === "log4j-core").vexStatus, "Not affected");
 assert.equal(isolatedProducts.find((row) => row.packageName === "unrelated-package").vexStatus, "Unknown");
+
+const substringProducts = buildExposureRows({
+  evidenceReports: [{
+    findings: [{ vulnerability: "CVE-2024-1234", packageName: "catalog" }],
+    vexStatements: [{
+      vulnerability: "CVE-2024-1234",
+      aliases: [],
+      products: ["log"],
+      status: "Not affected",
+      trusted: true
+    }]
+  }]
+});
+assert.equal(substringProducts[0].vexStatus, "Unknown", "substring product identities must not match");
 
 const inspector = JSON.stringify({
   findings: [{
