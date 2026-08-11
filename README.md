@@ -86,8 +86,9 @@ Verification includes server and browser-module syntax checks, API security smok
 ## Security Defaults
 
 - Security headers include CSP, HSTS in production, frame blocking, referrer policy, permissions policy, and content-sniffing protection.
-- Research and enrichment requests have per-client rate limits, bounded queues, request-body limits, upstream response limits, and allowlisted API methods.
+- Research and enrichment requests have per-client and CloudFront WAF rate limits, bounded queues, request-body limits, aggregate enrichment budgets, upstream response limits, and allowlisted API methods.
 - AWS API Gateway throttles the stage to 2 requests per second with a burst of 5; API Lambda reserved concurrency is 2.
+- CloudFront supplies a deployment-only origin secret, so direct calls to the public API Gateway endpoint are rejected.
 - Client identity uses the trusted API Gateway source address. Arbitrary forwarded headers are not trusted from public clients.
 - Static and deployment-artifact buckets block public access and use server-side encryption; the static bucket also has versioning and lifecycle cleanup.
 - External links are limited to HTTP(S), rendered text is escaped, and uploaded evidence is parsed as data rather than injected into markup.
