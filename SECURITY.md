@@ -24,6 +24,7 @@ Do not place private source tokens in the browser bundle, commit them to Git, or
 - Lambda logs have explicit 30-day retention and function-scoped write permissions; deployment artifacts are managed by a retained CloudFormation stack with versioning and expiration.
 - Scheduled-monitor state is encrypted in DynamoDB and expires after 180 days.
 - Production dependencies are checked with `npm audit --omit=dev` in `npm run verify`.
+- Release actions and the production container base are immutable; release bundles include a checksum, SPDX SBOM, and GitHub-signed provenance that the deployment script verifies.
 
 ## Intentional Omissions
 
