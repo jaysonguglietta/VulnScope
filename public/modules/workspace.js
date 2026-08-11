@@ -1,4 +1,12 @@
 const CVE_PATTERN = /CVE-\d{4}-\d{4,}/gi;
+const MAX_SOURCE_ROWS = 10000;
+const MAX_ARRAY_DIMENSION = 500;
+const MAX_VEX_STATEMENTS = 10000;
+const MAX_CSV_COLUMNS = 250;
+const MAX_CELL_LENGTH = 10000;
+const MAX_FLATTEN_DEPTH = 40;
+const MAX_FLATTEN_KEYS = 2000;
+const DEFAULT_MAX_OUTPUT_RECORDS = 50000;
 const VEX_STATES = new Map([
   ["affected", "Affected"],
   ["known_affected", "Affected"],
@@ -12,7 +20,7 @@ const VEX_STATES = new Map([
   ["in_triage", "Under investigation"]
 ]);
 
-export function parseEvidenceFile(file, text) {
+export function parseEvidenceFile(file, text, options = {}) {
   const trimmed = String(text || "").trim();
   const base = {
     id: makeId("evidence"),
@@ -25,6 +33,7 @@ export function parseEvidenceFile(file, text) {
     vexStatements: [],
     warnings: []
   };
+  base.recordLimit = Math.max(1, Math.min(DEFAULT_MAX_OUTPUT_RECORDS, Number(options.maxOutputRecords) || DEFAULT_MAX_OUTPUT_RECORDS));
   if (!trimmed) return { ...base, warnings: ["The evidence file is empty."] };
 
   if (/^[\[{]/.test(trimmed)) {
@@ -35,8 +44,11 @@ export function parseEvidenceFile(file, text) {
     }
   }
 
-  const rows = parseCsv(trimmed);
-  if (rows.length) return parseEvidenceRows({ ...base, format: "Cloud vulnerability CSV" }, rows);
+  const csv = parseCsv(trimmed);
+  if (csv.rows.length) {
+    if (csv.truncated) base.warnings.push(`CSV processing was capped at ${MAX_SOURCE_ROWS.toLocaleString()} rows and ${MAX_CSV_COLUMNS} columns.`);
+    return parseEvidenceRows({ ...base, format: "Cloud vulnerability CSV" }, csv.rows);
+  }
   return { ...base, warnings: ["The file was not recognized as supported JSON, VEX, or CSV evidence."] };
 }
 
@@ -58,15 +70,17 @@ function parseEvidenceJson(base, json) {
 function parseAwsInspector(base, rows) {
   const findings = [];
   const assets = [];
-  for (const row of rows.slice(0, 10000)) {
+  let truncated = rows.length > MAX_SOURCE_ROWS;
+  findingRows: for (const row of rows.slice(0, MAX_SOURCE_ROWS)) {
     const details = row.packageVulnerabilityDetails || {};
     const vulnerabilityIds = unique([
       details.vulnerabilityId,
       ...arrayValue(details.relatedVulnerabilities),
       ...extractCves(stringify(row.title))
-    ]).filter(Boolean);
-    const resources = arrayValue(row.resources);
-    const packages = arrayValue(details.vulnerablePackages);
+    ]).filter(Boolean).slice(0, MAX_ARRAY_DIMENSION);
+    const resources = arrayValue(row.resources).slice(0, MAX_ARRAY_DIMENSION);
+    const packages = arrayValue(details.vulnerablePackages).slice(0, MAX_ARRAY_DIMENSION);
+    if (arrayValue(row.resources).length > resources.length || arrayValue(details.vulnerablePackages).length > packages.length) truncated = true;
     const normalizedResources = resources.length ? resources : [{}];
     const normalizedPackages = packages.length ? packages : [{}];
     for (const resource of normalizedResources) {
@@ -102,24 +116,30 @@ function parseAwsInspector(base, rows) {
             remediation: row.remediation?.recommendation?.text || row.remediation?.recommendation?.url || "",
             source: "Amazon Inspector"
           }));
+          if (findings.length >= base.recordLimit) {
+            truncated = true;
+            break findingRows;
+          }
         }
       }
     }
   }
+  if (truncated) base.warnings.push(`Inspector expansion was capped at ${base.recordLimit.toLocaleString()} normalized records and ${MAX_ARRAY_DIMENSION} values per dimension.`);
   return finalizeReport(base, findings, assets, []);
 }
 
 function parseEvidenceRows(base, rows) {
   const findings = [];
   const assets = [];
-  for (const row of rows.slice(0, 10000)) {
+  let truncated = rows.length > MAX_SOURCE_ROWS;
+  rowLoop: for (const row of rows.slice(0, MAX_SOURCE_ROWS)) {
     const flat = flattenRecord(row);
     const vulnerabilityValues = [
       pick(flat, ["cve", "cveid", "vulnerabilityid", "vulnerability", "id"]),
       pick(flat, ["additionaldata.cve", "properties.cve", "metadata.cve"]),
       stringify(row)
     ];
-    const vulnerabilities = unique(vulnerabilityValues.flatMap(extractCves));
+    const vulnerabilities = unique(vulnerabilityValues.flatMap(extractCves)).slice(0, MAX_ARRAY_DIMENSION);
     if (!vulnerabilities.length) continue;
     const resourceId = pick(flat, ["resourceid", "resource.id", "resource", "resourceidentifier", "properties.resourceid"]);
     const provider = inferProvider(resourceId, flat);
@@ -151,16 +171,22 @@ function parseEvidenceRows(base, rows) {
         remediation: pick(flat, ["remediation", "recommendation", "solution"]),
         source: provider === "Azure" ? "Microsoft Defender for Cloud" : provider === "AWS" ? "AWS finding import" : "Cloud finding import"
       }));
+      if (findings.length >= base.recordLimit) {
+        truncated = true;
+        break rowLoop;
+      }
     }
   }
+  if (truncated) base.warnings.push(`Evidence processing was capped at ${base.recordLimit.toLocaleString()} normalized records.`);
   return finalizeReport(base, findings, assets, []);
 }
 
 function parseOpenVex(base, json) {
-  const statements = arrayValue(json.statements).map((statement) => normalizeVexStatement({
+  const sourceStatements = arrayValue(json.statements);
+  const statements = sourceStatements.slice(0, Math.min(MAX_VEX_STATEMENTS, base.recordLimit)).map((statement) => normalizeVexStatement({
     vulnerability: statement.vulnerability?.name || statement.vulnerability?.id,
     aliases: statement.vulnerability?.aliases,
-    products: arrayValue(statement.products).map((product) => product["@id"] || product.id || product.name).filter(Boolean),
+    products: arrayValue(statement.products).slice(0, MAX_ARRAY_DIMENSION).map((product) => product["@id"] || product.id || product.name).filter(Boolean),
     status: statement.status,
     justification: statement.justification,
     impact: statement.impact_statement,
@@ -169,18 +195,20 @@ function parseOpenVex(base, json) {
     timestamp: statement.timestamp || json.timestamp,
     source: "OpenVEX"
   })).filter((statement) => statement.vulnerability);
+  if (sourceStatements.length > statements.length) base.warnings.push(`VEX processing was capped at ${statements.length.toLocaleString()} statements.`);
   return finalizeReport(base, [], [], statements);
 }
 
 function parseCsafVex(base, json) {
   const names = buildCsafProductNames(json.product_tree);
   const statements = [];
-  for (const vulnerability of arrayValue(json.vulnerabilities)) {
+  let truncated = false;
+  vulnerabilityLoop: for (const vulnerability of arrayValue(json.vulnerabilities).slice(0, MAX_VEX_STATEMENTS)) {
     const status = vulnerability.product_status || {};
-    for (const [rawState, productIds] of Object.entries(status)) {
+    for (const [rawState, productIds] of Object.entries(status).slice(0, 20)) {
       statements.push(normalizeVexStatement({
         vulnerability: vulnerability.cve || vulnerability.title,
-        products: arrayValue(productIds).map((id) => names.get(id) || id),
+        products: arrayValue(productIds).slice(0, MAX_ARRAY_DIMENSION).map((id) => names.get(id) || id),
         status: rawState,
         justification: arrayValue(vulnerability.flags)[0]?.label || "",
         action: arrayValue(vulnerability.remediations).map((item) => item.details).filter(Boolean).join(" "),
@@ -189,16 +217,22 @@ function parseCsafVex(base, json) {
         timestamp: json.document?.tracking?.current_release_date,
         source: "CSAF VEX"
       }));
+      if (statements.length >= base.recordLimit) {
+        truncated = true;
+        break vulnerabilityLoop;
+      }
     }
   }
+  if (truncated || arrayValue(json.vulnerabilities).length > MAX_VEX_STATEMENTS) base.warnings.push(`CSAF VEX processing was capped at ${base.recordLimit.toLocaleString()} statements.`);
   return finalizeReport(base, [], [], statements.filter((statement) => statement.vulnerability));
 }
 
 function parseCycloneVex(base, json) {
-  const statements = arrayValue(json.vulnerabilities).map((vulnerability) => normalizeVexStatement({
+  const sourceVulnerabilities = arrayValue(json.vulnerabilities);
+  const statements = sourceVulnerabilities.slice(0, Math.min(MAX_VEX_STATEMENTS, base.recordLimit)).map((vulnerability) => normalizeVexStatement({
     vulnerability: vulnerability.id,
     aliases: arrayValue(vulnerability.references).map((item) => item.id),
-    products: arrayValue(vulnerability.affects).map((item) => item.ref).filter(Boolean),
+    products: arrayValue(vulnerability.affects).slice(0, MAX_ARRAY_DIMENSION).map((item) => item.ref).filter(Boolean),
     status: vulnerability.analysis?.state,
     justification: vulnerability.analysis?.justification,
     impact: vulnerability.analysis?.detail,
@@ -207,6 +241,7 @@ function parseCycloneVex(base, json) {
     timestamp: vulnerability.updated || vulnerability.published || json.metadata?.timestamp,
     source: "CycloneDX VEX"
   })).filter((statement) => statement.vulnerability && statement.status !== "Unknown");
+  if (sourceVulnerabilities.length > statements.length) base.warnings.push(`CycloneDX VEX processing was capped at ${statements.length.toLocaleString()} statements.`);
   return finalizeReport(base, [], [], statements);
 }
 
@@ -228,6 +263,9 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
           assetName: report.title,
           assetType: "SBOM",
           vexStatus: entry.vexStatus,
+          vexTrusted: Boolean(entry.vex?.trusted),
+          vexClaimedStatus: entry.vexStatus,
+          vexTrustReason: entry.vex?.trustReason || "Embedded SBOM VEX is unverified.",
           summary: entry.vex?.detail || entry.vex?.justification || ""
         }));
       }
@@ -266,9 +304,16 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
   const deduped = dedupeExposures(rows).map((row) => {
     const investigation = investigationMap.get(row.vulnerability);
     const vex = bestVexStatement(row, vexStatements);
+    const claimedVexStatus = vex?.status || row.vexClaimedStatus || row.vexStatus || "Unreviewed";
+    const vexTrusted = vex ? Boolean(vex.trusted) : Boolean(row.vexTrusted);
+    const suppressiveVex = ["Not affected", "Fixed"].includes(claimedVexStatus);
     const enriched = {
       ...row,
-      vexStatus: vex?.status || row.vexStatus || "Unreviewed",
+      vexStatus: suppressiveVex && !vexTrusted ? "Needs verification" : claimedVexStatus,
+      vexClaimedStatus: claimedVexStatus,
+      vexTrusted,
+      vexTrustReason: vex?.trustReason || row.vexTrustReason || "No trusted VEX decision is available.",
+      vexMatchedProducts: vex?.products || [],
       vexJustification: vex?.justification || vex?.impact || "",
       vexAction: vex?.action || "",
       kev: Boolean(investigation?.metrics?.kev?.listed || row.kev),
@@ -306,14 +351,17 @@ function normalizeVexStatement(value) {
   return {
     vulnerability: normalizeVulnerability(value.vulnerability),
     aliases: unique(arrayValue(value.aliases).map(normalizeVulnerability).filter(Boolean)),
-    products: unique(arrayValue(value.products).map((item) => String(item || "").trim()).filter(Boolean)),
+    products: unique(arrayValue(value.products).slice(0, MAX_ARRAY_DIMENSION).map((item) => boundedText(item, 1000).trim()).filter(Boolean)),
     status: normalizeVexStatus(value.status),
-    justification: String(value.justification || ""),
-    impact: String(value.impact || ""),
-    action: String(value.action || ""),
-    detail: String(value.detail || ""),
+    justification: boundedText(value.justification),
+    impact: boundedText(value.impact),
+    action: boundedText(value.action),
+    detail: boundedText(value.detail),
     timestamp: value.timestamp || null,
-    source: value.source || "VEX"
+    source: value.source || "VEX",
+    trusted: Boolean(value.trusted),
+    approvedAt: value.approvedAt || null,
+    trustReason: String(value.trustReason || "Imported VEX is unverified.")
   };
 }
 
@@ -350,6 +398,9 @@ function normalizeExposure(value) {
     workflowStatus: String(value.workflowStatus || value.status || "Needs triage"),
     owner: String(value.owner || ""),
     vexStatus: normalizeVexStatus(value.vexStatus || ""),
+    vexClaimedStatus: normalizeVexStatus(value.vexClaimedStatus || value.vexStatus || ""),
+    vexTrusted: Boolean(value.vexTrusted),
+    vexTrustReason: String(value.vexTrustReason || ""),
     references: arrayValue(value.references)
   };
 }
@@ -367,14 +418,17 @@ function normalizeAsset(value) {
 }
 
 function finalizeReport(base, findings, assets, vexStatements) {
-  const cleanFindings = findings.filter((item) => item.vulnerability);
-  const cleanAssets = dedupeBy(assets.filter((item) => item.id || item.name), (item) => `${item.provider}|${item.id}|${item.name}`);
+  const limit = base.recordLimit || DEFAULT_MAX_OUTPUT_RECORDS;
+  const cleanFindings = findings.filter((item) => item.vulnerability).slice(0, limit);
+  const cleanAssets = dedupeBy(assets.filter((item) => item.id || item.name), (item) => `${item.provider}|${item.id}|${item.name}`).slice(0, Math.max(0, limit - cleanFindings.length));
+  const cleanVexStatements = vexStatements.slice(0, Math.max(0, limit - cleanFindings.length - cleanAssets.length));
+  const { recordLimit, ...reportBase } = base;
   return {
-    ...base,
+    ...reportBase,
     findings: cleanFindings,
     assets: cleanAssets,
-    vexStatements,
-    summary: `${cleanFindings.length} finding${cleanFindings.length === 1 ? "" : "s"}, ${cleanAssets.length} asset${cleanAssets.length === 1 ? "" : "s"}, and ${vexStatements.length} VEX statement${vexStatements.length === 1 ? "" : "s"}.`
+    vexStatements: cleanVexStatements,
+    summary: `${cleanFindings.length} finding${cleanFindings.length === 1 ? "" : "s"}, ${cleanAssets.length} asset${cleanAssets.length === 1 ? "" : "s"}, and ${cleanVexStatements.length} VEX statement${cleanVexStatements.length === 1 ? "" : "s"}.`
   };
 }
 
@@ -399,9 +453,9 @@ function bestVexStatement(row, statements) {
   const matched = candidates.find((statement) => statement.products.some((item) => {
     const product = normalizeProductIdentity(item);
     if (product.length < 3) return false;
-    return rowProducts.some((value) => value === product || value.includes(product) || product.includes(value));
+    return rowProducts.some((value) => value === product);
   }));
-  return matched || candidates.find((statement) => !statement.products.length);
+  return matched;
 }
 
 function exposurePriority(row) {
@@ -430,6 +484,12 @@ function parseCsv(text) {
   let row = [];
   let value = "";
   let quoted = false;
+  let truncated = false;
+  const pushValue = () => {
+    if (row.length < MAX_CSV_COLUMNS) row.push(value.replace(/\r$/, ""));
+    else truncated = true;
+    value = "";
+  };
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
     if (quoted) {
@@ -437,31 +497,40 @@ function parseCsv(text) {
         value += '"';
         index += 1;
       } else if (char === '"') quoted = false;
-      else value += char;
+      else if (value.length < MAX_CELL_LENGTH) value += char;
+      else truncated = true;
     } else if (char === '"') quoted = true;
     else if (char === ",") {
-      row.push(value);
-      value = "";
+      pushValue();
     } else if (char === "\n") {
-      row.push(value.replace(/\r$/, ""));
+      pushValue();
       rows.push(row);
       row = [];
-      value = "";
-    } else value += char;
+      if (rows.length > MAX_SOURCE_ROWS) {
+        truncated = true;
+        break;
+      }
+    } else if (value.length < MAX_CELL_LENGTH) value += char;
+    else truncated = true;
   }
-  row.push(value.replace(/\r$/, ""));
+  pushValue();
   if (row.some((item) => item.trim())) rows.push(row);
-  if (rows.length < 2) return [];
+  if (rows.length < 2) return { rows: [], truncated };
   const headers = rows[0].map((item) => normalizeKey(item));
-  return rows.slice(1).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ""])));
+  return {
+    rows: rows.slice(1, MAX_SOURCE_ROWS + 1).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ""]))),
+    truncated
+  };
 }
 
-function flattenRecord(value, prefix = "", output = {}) {
+function flattenRecord(value, prefix = "", output = {}, depth = 0) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return output;
+  if (depth >= MAX_FLATTEN_DEPTH || Object.keys(output).length >= MAX_FLATTEN_KEYS) return output;
   for (const [key, child] of Object.entries(value)) {
+    if (Object.keys(output).length >= MAX_FLATTEN_KEYS) break;
     const path = normalizeKey(prefix ? `${prefix}.${key}` : key);
-    if (child && typeof child === "object" && !Array.isArray(child)) flattenRecord(child, path, output);
-    else output[path] = Array.isArray(child) ? child.join(", ") : child;
+    if (child && typeof child === "object" && !Array.isArray(child)) flattenRecord(child, path, output, depth + 1);
+    else output[path] = boundedText(Array.isArray(child) ? child.slice(0, MAX_ARRAY_DIMENSION).join(", ") : child);
   }
   return output;
 }
@@ -491,10 +560,11 @@ function isCsafVex(json) {
 
 function buildCsafProductNames(productTree) {
   const output = new Map();
-  const visit = (branch) => {
+  const visit = (branch, depth = 0) => {
+    if (depth >= MAX_FLATTEN_DEPTH || output.size >= MAX_FLATTEN_KEYS) return;
     const product = branch?.product;
     if (product?.product_id) output.set(product.product_id, product.name || product.product_id);
-    for (const child of arrayValue(branch?.branches)) visit(child);
+    for (const child of arrayValue(branch?.branches).slice(0, MAX_ARRAY_DIMENSION)) visit(child, depth + 1);
   };
   for (const branch of arrayValue(productTree?.branches)) visit(branch);
   for (const relationship of arrayValue(productTree?.relationships)) {
@@ -598,6 +668,10 @@ function stringify(value) {
 
 function safeMessage(error) {
   return String(error?.message || "invalid input").slice(0, 180);
+}
+
+function boundedText(value, maxLength = MAX_CELL_LENGTH) {
+  return String(value || "").slice(0, maxLength);
 }
 
 function makeId(prefix) {

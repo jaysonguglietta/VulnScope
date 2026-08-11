@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
-import { buildOsvQuery, normalizeOsvVulnerability } from "../server.mjs";
+import { buildOsvQuery, handleApiRequest, normalizeOsvVulnerability } from "../server.mjs";
 
 const versionedPurlQuery = buildOsvQuery({
   purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
@@ -31,6 +31,17 @@ assert(alphaOsv.affected[0].package.name === "alpha", "the matching affected pac
 assert(alphaOsv.fixProvenance[0].package === "pkg:npm/alpha", "fix provenance should retain the matched PURL");
 const missingOsv = normalizeOsvVulnerability(multiPackageOsv, {}, { purl: "pkg:npm/gamma@1.0.0", ecosystem: "npm", name: "gamma" });
 assert(missingOsv.fixedVersions.length === 0, "unmatched packages must not inherit another package's fix");
+
+process.env.ORIGIN_VERIFY_SECRET = "test-origin-secret-that-is-at-least-32-bytes";
+const deniedOrigin = await handleApiRequest({ path: "/api/health", method: "GET", headers: {} });
+assert(deniedOrigin.statusCode === 403, "configured origin verification should reject direct API requests");
+const acceptedOrigin = await handleApiRequest({
+  path: "/api/health",
+  method: "GET",
+  headers: { "x-origin-verify": process.env.ORIGIN_VERIFY_SECRET }
+});
+assert(acceptedOrigin.statusCode === 200, "configured origin verification should accept the trusted origin header");
+delete process.env.ORIGIN_VERIFY_SECRET;
 
 let child;
 const rootUrl = await startTestServer();
