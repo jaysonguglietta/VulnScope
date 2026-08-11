@@ -1,4 +1,5 @@
 import { buildExposureRows, summarizeExposureRows } from "./modules/workspace.js";
+import { csvCell } from "./modules/csv.js";
 
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
@@ -563,6 +564,11 @@ async function handleSbomFiles(files) {
     else parsed.push(parseSbomFile(item.file, item.text));
   }
 
+  reviewSuppressiveVexClaims(
+    parsed.flatMap((file) => file.vulnerabilities || []).map((vulnerability) => vulnerability.vex).filter(Boolean),
+    "the uploaded SBOM"
+  );
+
   if (!parsed.length) {
     showToast("No SBOM files were parsed.");
     return;
@@ -667,6 +673,7 @@ async function handleEvidenceFiles(files) {
     return;
   }
   if (warnings.length) reports[0].warnings = [...warnings, ...(reports[0].warnings || [])];
+  reviewSuppressiveVexClaims(reports.flatMap((report) => report.vexStatements || []), "the imported VEX evidence");
   state.evidenceReports = [...reports, ...state.evidenceReports].slice(0, 12);
   state.activeEvidenceId = reports[0].id;
   state.view = "evidence";
@@ -704,6 +711,21 @@ async function parseEvidenceInBackground(files) {
     });
   } finally {
     worker.terminate();
+  }
+}
+
+function reviewSuppressiveVexClaims(statements, sourceLabel) {
+  const suppressive = statements.filter((statement) => ["Not affected", "Fixed"].includes(statement.status));
+  if (!suppressive.length) return;
+  const approved = window.confirm(
+    `${sourceLabel} contains ${suppressive.length} suppressive VEX claim${suppressive.length === 1 ? "" : "s"}. ` +
+    "Approve these claims for exact matching products? Unapproved claims remain visible but do not lower exposure priority."
+  );
+  const reviewedAt = new Date().toISOString();
+  for (const statement of suppressive) {
+    statement.trusted = approved;
+    statement.approvedAt = approved ? reviewedAt : null;
+    statement.trustReason = approved ? "Analyst approved during import." : "Imported VEX was not approved for suppression.";
   }
 }
 
@@ -933,7 +955,7 @@ function renderExposureTable(rows) {
               <td><strong>${escapeHtml(row.packageName || row.assetName || "Unmapped")}</strong><br><span class="muted-cell">${escapeHtml(row.assetName || row.assetId || row.sourceFile || row.source)}</span></td>
               <td>${escapeHtml(row.installedVersion || "n/a")}${row.fixedVersion ? `<br><span class="fixed-version">Fix: ${escapeHtml(row.fixedVersion)}</span>` : ""}</td>
               <td>${escapeHtml(row.provider || row.source)}<br><span class="muted-cell">${escapeHtml(row.exploitStatus || "Unknown")}</span></td>
-              <td><span class="vex-badge vex-${escapeAttr(classToken(row.vexStatus))}">${escapeHtml(row.vexStatus)}</span>${row.vexJustification ? `<br><span class="muted-cell" title="${escapeAttr(row.vexJustification)}">${escapeHtml(row.vexJustification.slice(0, 90))}</span>` : ""}</td>
+              <td><span class="vex-badge vex-${escapeAttr(classToken(row.vexStatus))}">${escapeHtml(row.vexStatus)}</span><br><span class="muted-cell" title="${escapeAttr(row.vexTrustReason)}">${row.vexTrusted ? "Analyst approved" : `Unverified claim: ${escapeHtml(row.vexClaimedStatus)}`}</span>${row.vexJustification ? `<br><span class="muted-cell" title="${escapeAttr(row.vexJustification)}">${escapeHtml(row.vexJustification.slice(0, 90))}</span>` : ""}</td>
               <td>${/^CVE-\d{4}-\d{4,}$/.test(row.vulnerability) ? `<button class="secondary-button table-button" type="button" data-action="research-exposure" data-value="${escapeAttr(row.vulnerability)}">Research</button>` : `<span class="muted-cell">Advisory only</span>`}</td>
             </tr>
           `).join("")}
@@ -954,14 +976,9 @@ function exportExposureCsv() {
     showToast("No exposure rows to export.");
     return;
   }
-  const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Justification", "Owner", "Workflow Status"];
-  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexJustification, row.owner, row.workflowStatus]);
+  const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Claimed Status", "VEX Trust", "VEX Justification", "Owner", "Workflow Status"];
+  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexClaimedStatus, row.vexTrusted ? row.vexTrustReason : `Unverified: ${row.vexTrustReason}`, row.vexJustification, row.owner, row.workflowStatus]);
   download("vulnscope-exposure-register.csv", [headers, ...values].map((record) => record.map(csvCell).join(",")).join("\n"), "text/csv");
-}
-
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function openBulkWorkspace() {
@@ -1804,9 +1821,10 @@ function renderVexStatements(statements) {
   if (!statements.length) return `<p>No VEX statements were found in this file.</p>`;
   return `<div class="card-grid">${statements.slice(0, 100).map((statement) => `
     <div class="action-item">
-      <div class="badge-row"><span class="badge">${escapeHtml(statement.vulnerability)}</span><span class="vex-badge">${escapeHtml(statement.status)}</span></div>
+      <div class="badge-row"><span class="badge">${escapeHtml(statement.vulnerability)}</span><span class="vex-badge">${escapeHtml(statement.status)}</span><span class="badge">${statement.trusted ? "Analyst approved" : "Unverified"}</span></div>
       <strong>${escapeHtml(statement.products.join(", ") || "All referenced products")}</strong>
       <p>${escapeHtml(statement.justification || statement.impact || statement.detail || "No justification supplied.")}</p>
+      <p class="muted-cell">${escapeHtml(statement.trustReason)}</p>
       ${statement.action ? `<p><strong>Action:</strong> ${escapeHtml(statement.action)}</p>` : ""}
     </div>
   `).join("")}</div>${statements.length > 100 ? `<p class="table-note">Showing the first 100 VEX statements.</p>` : ""}`;

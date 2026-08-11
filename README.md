@@ -54,6 +54,8 @@ Raw SBOM, cloud finding, and VEX files are parsed locally and retained only in m
 
 OSV enrichment is a separate, explicit action. After confirmation, VulnScope sends only normalized package identifiers, ecosystems, and versions to the server, which queries OSV. Do not enrich package metadata that your policy treats as confidential.
 
+Suppressive VEX claims require an exact product identity match and explicit analyst approval during import. Unapproved `Not affected` and `Fixed` claims remain visible as `Needs verification` and do not lower exposure priority.
+
 Case notes and watchlist entries are stored in browser local storage and pruned after 90 days. Authentication and request logging are intentionally excluded; do not treat this deployment as a shared confidential case-management system.
 
 ## Run Locally
@@ -86,8 +88,9 @@ Verification includes server and browser-module syntax checks, API security smok
 ## Security Defaults
 
 - Security headers include CSP, HSTS in production, frame blocking, referrer policy, permissions policy, and content-sniffing protection.
-- Research and enrichment requests have per-client rate limits, bounded queues, request-body limits, upstream response limits, and allowlisted API methods.
+- Research and enrichment requests have per-client and CloudFront WAF rate limits, bounded queues, request-body limits, aggregate enrichment budgets, upstream response limits, and allowlisted API methods.
 - AWS API Gateway throttles the stage to 2 requests per second with a burst of 5; API Lambda reserved concurrency is 2.
+- CloudFront supplies a deployment-only origin secret, so direct calls to the public API Gateway endpoint are rejected.
 - Client identity uses the trusted API Gateway source address. Arbitrary forwarded headers are not trusted from public clients.
 - Static and deployment-artifact buckets block public access and use server-side encryption; the static bucket also has versioning and lifecycle cleanup.
 - External links are limited to HTTP(S), rendered text is escaped, and uploaded evidence is parsed as data rather than injected into markup.

@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -20,12 +21,18 @@ const researchQueueMax = positiveInt(process.env.RESEARCH_QUEUE_MAX, 20);
 const outboundConcurrency = positiveInt(process.env.OUTBOUND_CONCURRENCY, 8);
 const outboundQueueMax = positiveInt(process.env.OUTBOUND_QUEUE_MAX, 50);
 const apiBodyMaxBytes = positiveInt(process.env.API_BODY_MAX_BYTES, 256 * 1024);
-const enrichmentPackageMax = positiveInt(process.env.ENRICHMENT_PACKAGE_MAX, 200);
-const enrichmentVulnerabilityMax = positiveInt(process.env.ENRICHMENT_VULNERABILITY_MAX, 120);
+const enrichmentPackageMax = positiveInt(process.env.ENRICHMENT_PACKAGE_MAX, 50);
+const enrichmentVulnerabilityMax = positiveInt(process.env.ENRICHMENT_VULNERABILITY_MAX, 40);
+const enrichmentOutboundMaxCalls = positiveInt(process.env.ENRICHMENT_OUTBOUND_MAX_CALLS, 41);
+const enrichmentOutboundMaxBytes = positiveInt(process.env.ENRICHMENT_OUTBOUND_MAX_BYTES, 32 * 1024 * 1024);
+const enrichmentDeadlineMs = positiveInt(process.env.ENRICHMENT_DEADLINE_MS, 15 * 1000);
+const osvDetailCacheTtlMs = positiveInt(process.env.OSV_DETAIL_CACHE_TTL_MS, 60 * 60 * 1000);
+const osvDetailCacheMaxEntries = positiveInt(process.env.OSV_DETAIL_CACHE_MAX_ENTRIES, 500);
 const rateLimitBuckets = new Map();
 const researchQueue = [];
 const outboundQueue = [];
 const sourceTelemetry = new Map();
+const osvDetailCache = new Map();
 let activeResearch = 0;
 let activeOutbound = 0;
 
@@ -486,6 +493,9 @@ export async function handleApiRequest({
   body = ""
 }) {
   const normalizedMethod = String(method || "GET").toUpperCase();
+  if (path.startsWith("/api/") && !isAuthorizedOrigin(headers)) {
+    return jsonApiResponse({ error: true, message: "Request origin was not accepted." }, 403);
+  }
   if (path === "/api/health") {
     if (normalizedMethod !== "GET") return methodNotAllowed(["GET"]);
     return jsonApiResponse({
@@ -577,6 +587,15 @@ export async function handleApiRequest({
     return jsonApiResponse({ error: true, message: "API route not found." }, 404);
   }
   return null;
+}
+
+function isAuthorizedOrigin(headers) {
+  const expected = String(process.env.ORIGIN_VERIFY_SECRET || "");
+  if (!expected) return true;
+  const provided = String(headers?.["x-origin-verify"] || headers?.["X-Origin-Verify"] || "");
+  const expectedBytes = Buffer.from(expected);
+  const providedBytes = Buffer.from(provided);
+  return expectedBytes.length === providedBytes.length && timingSafeEqual(expectedBytes, providedBytes);
 }
 
 function methodNotAllowed(allowed) {
@@ -1284,6 +1303,11 @@ async function enrichPackages(packages) {
 }
 
 async function fetchOsvPackageMatches(packages) {
+  const budget = createOutboundBudget({
+    maxCalls: enrichmentOutboundMaxCalls,
+    maxBytes: enrichmentOutboundMaxBytes,
+    deadlineMs: enrichmentDeadlineMs
+  });
   const queries = packages.map(buildOsvQuery);
   const batch = await fetchJson("https://api.osv.dev/v1/querybatch", {
     method: "POST",
@@ -1293,7 +1317,7 @@ async function fetchOsvPackageMatches(packages) {
       "user-agent": "VulnScope/0.2"
     },
     body: JSON.stringify({ queries })
-  });
+  }, budget);
   if (!Array.isArray(batch?.results) || batch.results.length !== packages.length) {
     throw new Error("No OSV package results returned.");
   }
@@ -1305,9 +1329,7 @@ async function fetchOsvPackageMatches(packages) {
     const group = selectedIds.slice(index, index + outboundConcurrency);
     detailRows.push(...await Promise.all(group.map(async (id) => {
       try {
-        return [id, await fetchJson(`https://api.osv.dev/v1/vulns/${encodeURIComponent(id)}`, {
-          headers: { accept: "application/json", "user-agent": "VulnScope/0.2" }
-        })];
+        return [id, await fetchOsvVulnerability(id, budget)];
       } catch {
         return [id, null];
       }
@@ -1326,6 +1348,27 @@ async function fetchOsvPackageMatches(packages) {
     truncated: ids.length > selectedIds.length,
     message: `Matched ${ids.length} OSV record${ids.length === 1 ? "" : "s"} across ${packages.length} package${packages.length === 1 ? "" : "s"}.`
   };
+}
+
+async function fetchOsvVulnerability(id, budget) {
+  const cached = osvDetailCache.get(id);
+  if (cached && Date.now() - cached.createdAt < osvDetailCacheTtlMs) {
+    osvDetailCache.delete(id);
+    osvDetailCache.set(id, cached);
+    return cached.value;
+  }
+  if (cached) osvDetailCache.delete(id);
+
+  const value = await fetchJson(`https://api.osv.dev/v1/vulns/${encodeURIComponent(id)}`, {
+    headers: { accept: "application/json", "user-agent": "VulnScope/0.2" }
+  }, budget);
+  osvDetailCache.set(id, { createdAt: Date.now(), value });
+  while (osvDetailCache.size > osvDetailCacheMaxEntries) {
+    const oldestKey = osvDetailCache.keys().next().value;
+    if (!oldestKey) break;
+    osvDetailCache.delete(oldestKey);
+  }
+  return value;
 }
 
 export function buildOsvQuery(pkg) {
@@ -1400,16 +1443,43 @@ function safeHttpUrl(value) {
   }
 }
 
-async function fetchJson(url, options = {}) {
+function createOutboundBudget({ maxCalls, maxBytes, deadlineMs }) {
+  return {
+    calls: 0,
+    bytes: 0,
+    maxCalls,
+    maxBytes,
+    deadlineAt: Date.now() + deadlineMs
+  };
+}
+
+function reserveOutboundCall(budget) {
+  if (!budget) return;
+  if (Date.now() >= budget.deadlineAt) throw new Error("Enrichment request exceeded its outbound deadline.");
+  if (budget.calls >= budget.maxCalls) throw new Error("Enrichment request exceeded its outbound call budget.");
+  budget.calls += 1;
+}
+
+function accountOutboundBytes(budget, text) {
+  if (!budget) return;
+  budget.bytes += Buffer.byteLength(text, "utf8");
+  if (budget.bytes > budget.maxBytes) throw new Error("Enrichment request exceeded its aggregate response budget.");
+}
+
+async function fetchJson(url, options = {}, budget = null) {
+  reserveOutboundCall(budget);
   return withOutboundSlot(async () => {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+    const remainingBudgetMs = budget ? budget.deadlineAt - Date.now() : requestTimeoutMs;
+    if (remainingBudgetMs <= 0) throw new Error("Enrichment request exceeded its outbound deadline.");
+    const timeout = setTimeout(() => controller.abort(), Math.min(requestTimeoutMs, remainingBudgetMs));
     try {
       const response = await fetch(url, {
         ...options,
         signal: controller.signal
       });
       const text = await readLimitedResponseText(response);
+      accountOutboundBytes(budget, text);
       if (!response.ok) {
         throw new Error(`Source returned ${response.status} ${response.statusText || "HTTP error"}.`);
       }
