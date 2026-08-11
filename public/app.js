@@ -953,7 +953,7 @@ function renderExposureTable(rows) {
               <td><span class="risk-badge risk-${escapeAttr(row.priority)}">${escapeHtml(row.priority)} ${row.priorityScore}</span></td>
               <td><strong>${escapeHtml(row.vulnerability)}</strong><br><span class="muted-cell">${escapeHtml(row.severity || "Unknown")} ${row.kev ? "- KEV" : ""}${row.epss !== null ? ` - EPSS ${formatPercent(row.epss)}` : ""}</span></td>
               <td><strong>${escapeHtml(row.packageName || row.assetName || "Unmapped")}</strong><br><span class="muted-cell">${escapeHtml(row.assetName || row.assetId || row.sourceFile || row.source)}</span></td>
-              <td>${escapeHtml(row.installedVersion || "n/a")}${row.fixedVersion ? `<br><span class="fixed-version">Fix: ${escapeHtml(row.fixedVersion)}</span>` : ""}</td>
+              <td>${escapeHtml(row.installedVersion || "n/a")}${row.fixedVersions?.length ? `<br><span class="fixed-version" title="${escapeAttr(row.fixProvenance?.map((item) => `${item.package}: ${item.version}`).join("; ") || "OSV package-specific fix candidates")}">Fix: ${escapeHtml(row.fixedVersions.join(" or "))}</span>` : ""}</td>
               <td>${escapeHtml(row.provider || row.source)}<br><span class="muted-cell">${escapeHtml(row.exploitStatus || "Unknown")}</span></td>
               <td><span class="vex-badge vex-${escapeAttr(classToken(row.vexStatus))}">${escapeHtml(row.vexStatus)}</span><br><span class="muted-cell" title="${escapeAttr(row.vexTrustReason)}">${row.vexTrusted ? "Analyst approved" : `Unverified claim: ${escapeHtml(row.vexClaimedStatus)}`}</span>${row.vexJustification ? `<br><span class="muted-cell" title="${escapeAttr(row.vexJustification)}">${escapeHtml(row.vexJustification.slice(0, 90))}</span>` : ""}</td>
               <td>${/^CVE-\d{4}-\d{4,}$/.test(row.vulnerability) ? `<button class="secondary-button table-button" type="button" data-action="research-exposure" data-value="${escapeAttr(row.vulnerability)}">Research</button>` : `<span class="muted-cell">Advisory only</span>`}</td>
@@ -977,7 +977,7 @@ function exportExposureCsv() {
     return;
   }
   const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Claimed Status", "VEX Trust", "VEX Justification", "Owner", "Workflow Status"];
-  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexClaimedStatus, row.vexTrusted ? row.vexTrustReason : `Unverified: ${row.vexTrustReason}`, row.vexJustification, row.owner, row.workflowStatus]);
+  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersions?.join(" or ") || row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexClaimedStatus, row.vexTrusted ? row.vexTrustReason : `Unverified: ${row.vexTrustReason}`, row.vexJustification, row.owner, row.workflowStatus]);
   download("vulnscope-exposure-register.csv", [headers, ...values].map((record) => record.map(csvCell).join(",")).join("\n"), "text/csv");
 }
 

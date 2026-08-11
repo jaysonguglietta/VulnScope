@@ -1340,7 +1340,7 @@ async function fetchOsvPackageMatches(packages) {
     ...pkg,
     vulnerabilities: (batch.results[index]?.vulns || [])
       .filter((item) => selectedIds.includes(item.id))
-      .map((item) => normalizeOsvVulnerability(details.get(item.id), item))
+      .map((item) => normalizeOsvVulnerability(details.get(item.id), item, pkg))
   }));
   return {
     packages: enriched,
@@ -1388,13 +1388,20 @@ export function buildOsvQuery(pkg) {
   };
 }
 
-function normalizeOsvVulnerability(detail, fallback = {}) {
-  const affected = (Array.isArray(detail?.affected) ? detail.affected : []).slice(0, 12);
+export function normalizeOsvVulnerability(detail, fallback = {}, pkg = {}) {
+  const allAffected = Array.isArray(detail?.affected) ? detail.affected : [];
+  const affected = allAffected.filter((entry) => osvAffectedMatchesPackage(entry, pkg)).slice(0, 12);
   const aliases = (Array.isArray(detail?.aliases) ? detail.aliases : []).slice(0, 50).map((value) => boundedString(value, 120));
   const cves = aliases.filter((value) => /^CVE-\d{4}-\d{4,}$/i.test(value));
-  const fixedVersions = [...new Set(affected.flatMap((entry) => (entry.ranges || [])
-    .slice(0, 8)
-    .flatMap((range) => (range.events || []).slice(0, 50).map((event) => boundedString(event.fixed, 200)).filter(Boolean))))].slice(0, 100);
+  const fixProvenance = affected.flatMap((entry) => (entry.ranges || []).slice(0, 8).flatMap((range) =>
+    (range.events || []).slice(0, 50).map((event) => boundedString(event.fixed, 200)).filter(Boolean).map((version) => ({
+      version,
+      package: entry.package?.purl || entry.package?.name || pkg.purl || pkg.name || "Unknown package",
+      ecosystem: entry.package?.ecosystem || pkg.ecosystem || "",
+      rangeType: boundedString(range.type, 40)
+    }))
+  )).slice(0, 100);
+  const fixedVersions = [...new Set(fixProvenance.map((item) => item.version))];
   return {
     id: boundedString(detail?.id || fallback.id || "Unknown", 120),
     aliases,
@@ -1406,12 +1413,34 @@ function normalizeOsvVulnerability(detail, fallback = {}) {
     modified: detail?.modified || fallback.modified || null,
     withdrawn: detail?.withdrawn || null,
     fixedVersions,
+    fixProvenance,
     affected: affected.map(normalizeOsvAffectedEntry),
     references: (detail?.references || []).slice(0, 50).map((reference) => ({
       type: boundedString(reference.type || "WEB", 40),
       url: safeHttpUrl(reference.url)
     })).filter((reference) => reference.url)
   };
+}
+
+function osvAffectedMatchesPackage(entry, pkg) {
+  const affectedPackage = entry?.package || {};
+  const affectedPurl = normalizePurlPackageIdentity(affectedPackage.purl);
+  const queryPurl = normalizePurlPackageIdentity(pkg.purl);
+  if (affectedPurl || queryPurl) return Boolean(affectedPurl && queryPurl && affectedPurl === queryPurl);
+
+  const affectedName = boundedString(affectedPackage.name, 300).toLowerCase();
+  const queryName = boundedString(pkg.name, 300).toLowerCase();
+  const affectedEcosystem = boundedString(affectedPackage.ecosystem, 80).toLowerCase();
+  const queryEcosystem = boundedString(pkg.ecosystem, 80).toLowerCase();
+  return Boolean(affectedName && queryName && affectedEcosystem && queryEcosystem && affectedName === queryName && affectedEcosystem === queryEcosystem);
+}
+
+function normalizePurlPackageIdentity(value) {
+  const purl = boundedString(value, 1000).trim().toLowerCase().split(/[?#]/)[0];
+  if (!purl.startsWith("pkg:")) return "";
+  const slash = purl.lastIndexOf("/");
+  const version = purl.lastIndexOf("@");
+  return version > slash ? purl.slice(0, version) : purl;
 }
 
 function normalizeOsvAffectedEntry(entry) {

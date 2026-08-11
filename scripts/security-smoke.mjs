@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
-import { buildOsvQuery, handleApiRequest } from "../server.mjs";
+import { buildOsvQuery, handleApiRequest, normalizeOsvVulnerability } from "../server.mjs";
 
 const versionedPurlQuery = buildOsvQuery({
   purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
@@ -10,6 +10,27 @@ const versionedPurlQuery = buildOsvQuery({
 assert(!Object.hasOwn(versionedPurlQuery, "version"), "versioned PURLs must not duplicate the OSV version field");
 const unversionedPurlQuery = buildOsvQuery({ purl: "pkg:maven/org.example/library", version: "1.2.3" });
 assert(unversionedPurlQuery.version === "1.2.3", "unversioned PURLs should retain an explicit OSV version");
+
+const multiPackageOsv = {
+  id: "GHSA-test",
+  affected: [
+    {
+      package: { ecosystem: "npm", name: "alpha", purl: "pkg:npm/alpha" },
+      ranges: [{ type: "SEMVER", events: [{ introduced: "0" }, { fixed: "2.0.0" }] }]
+    },
+    {
+      package: { ecosystem: "npm", name: "beta", purl: "pkg:npm/beta" },
+      ranges: [{ type: "SEMVER", events: [{ introduced: "0" }, { fixed: "9.0.0" }] }]
+    }
+  ]
+};
+const alphaOsv = normalizeOsvVulnerability(multiPackageOsv, {}, { purl: "pkg:npm/alpha@1.0.0", ecosystem: "npm", name: "alpha" });
+assert(JSON.stringify(alphaOsv.fixedVersions) === JSON.stringify(["2.0.0"]), "OSV fixes must come only from the matching package entry");
+assert(alphaOsv.affected.length === 1, "only one matching affected entry should remain");
+assert(alphaOsv.affected[0].package.name === "alpha", "the matching affected package should be alpha");
+assert(alphaOsv.fixProvenance[0].package === "pkg:npm/alpha", "fix provenance should retain the matched PURL");
+const missingOsv = normalizeOsvVulnerability(multiPackageOsv, {}, { purl: "pkg:npm/gamma@1.0.0", ecosystem: "npm", name: "gamma" });
+assert(missingOsv.fixedVersions.length === 0, "unmatched packages must not inherit another package's fix");
 
 process.env.ORIGIN_VERIFY_SECRET = "test-origin-secret-that-is-at-least-32-bytes";
 const deniedOrigin = await handleApiRequest({ path: "/api/health", method: "GET", headers: {} });
