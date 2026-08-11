@@ -54,6 +54,12 @@ Resources:
             NoncurrentVersionExpiration:
               NoncurrentDays: 7
 
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/vulnscope-api
+      RetentionInDays: 30
+
   ApiFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -71,13 +77,13 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/vulnscope-api:*
 
   ApiFunction:
     Type: AWS::Lambda::Function
+    DependsOn: ApiLogGroup
     Properties:
       FunctionName: vulnscope-api
       Description: VulnScope CVE research API.
@@ -131,6 +137,13 @@ Resources:
     Properties:
       DisplayName: VulnScope CVE monitor
 
+  MonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableScheduledMonitor
+    Properties:
+      LogGroupName: /aws/lambda/vulnscope-monitor
+      RetentionInDays: 30
+
   MonitorEmailSubscription:
     Type: AWS::SNS::Subscription
     Condition: EnableScheduledMonitor
@@ -157,10 +170,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/vulnscope-monitor:*
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -173,6 +185,7 @@ Resources:
   MonitorFunction:
     Type: AWS::Lambda::Function
     Condition: EnableScheduledMonitor
+    DependsOn: MonitorLogGroup
     Properties:
       FunctionName: vulnscope-monitor
       Description: Refreshes deployment-configured CVEs and sends material-change notifications.
