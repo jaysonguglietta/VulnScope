@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.mjs",
     "check": "node --check server.mjs && node --check lambda.mjs && node --check monitor.mjs",
-    "check:client": "node --check public/app.js && node --check public/sbom-worker.js && node --check public/modules/date.js && node --check public/modules/sbom-worker-core.js && node --check public/modules/workspace.js",
+    "check:client": "node --check public/app.js && node --check public/evidence-worker.js && node --check public/sbom-worker.js && node --check public/modules/csv.js && node --check public/modules/date.js && node --check public/modules/sbom-worker-core.js && node --check public/modules/workspace.js",
     "test": "node scripts/security-smoke.mjs && node scripts/sbom-parser-smoke.mjs",
     "verify": "npm run check && npm run check:client && npm test && npm audit --omit=dev",
     "deploy:aws": "bash scripts/deploy-aws.sh"

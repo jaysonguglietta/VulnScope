@@ -22,6 +22,10 @@ Parameters:
   MonitorScheduleExpression:
     Type: String
     Default: rate(1 day)
+  ApiOriginSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
 
 Conditions:
   EnableScheduledMonitor: !And
@@ -54,6 +58,12 @@ Resources:
             NoncurrentVersionExpiration:
               NoncurrentDays: 7
 
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/vulnscope-api
+      RetentionInDays: 30
+
   ApiFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -71,13 +81,13 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/vulnscope-api:*
 
   ApiFunction:
     Type: AWS::Lambda::Function
+    DependsOn: ApiLogGroup
     Properties:
       FunctionName: vulnscope-api
       Description: VulnScope CVE research API.
@@ -105,8 +115,14 @@ Resources:
           CACHE_MAX_ENTRIES: "300"
           RESPONSE_MAX_BYTES: "8388608"
           API_BODY_MAX_BYTES: "262144"
-          ENRICHMENT_PACKAGE_MAX: "200"
-          ENRICHMENT_VULNERABILITY_MAX: "120"
+          ENRICHMENT_PACKAGE_MAX: "50"
+          ENRICHMENT_VULNERABILITY_MAX: "40"
+          ENRICHMENT_OUTBOUND_MAX_CALLS: "41"
+          ENRICHMENT_OUTBOUND_MAX_BYTES: "33554432"
+          ENRICHMENT_DEADLINE_MS: "15000"
+          OSV_DETAIL_CACHE_TTL_MS: "3600000"
+          OSV_DETAIL_CACHE_MAX_ENTRIES: "500"
+          ORIGIN_VERIFY_SECRET: !Ref ApiOriginSecret
 
   MonitorTable:
     Type: AWS::DynamoDB::Table
@@ -130,6 +146,13 @@ Resources:
     Condition: EnableScheduledMonitor
     Properties:
       DisplayName: VulnScope CVE monitor
+
+  MonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableScheduledMonitor
+    Properties:
+      LogGroupName: /aws/lambda/vulnscope-monitor
+      RetentionInDays: 30
 
   MonitorEmailSubscription:
     Type: AWS::SNS::Subscription
@@ -157,10 +180,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/vulnscope-monitor:*
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -173,6 +195,7 @@ Resources:
   MonitorFunction:
     Type: AWS::Lambda::Function
     Condition: EnableScheduledMonitor
+    DependsOn: MonitorLogGroup
     Properties:
       FunctionName: vulnscope-monitor
       Description: Refreshes deployment-configured CVEs and sends material-change notifications.
@@ -319,11 +342,58 @@ Resources:
               Override: true
               Value: camera=(), microphone=(), geolocation=(), payment=(), usb=()
 
+  ApiWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AWS::StackName}-api-rate-limit
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AWS::StackName}-api-web-acl
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: ApiIpRateLimit
+          Priority: 0
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              AggregateKeyType: IP
+              Limit: 100
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: /api/
+                  TextTransformations:
+                    - Priority: 0
+                      Type: NONE
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${AWS::StackName}-api-ip-rate-limit
+            SampledRequestsEnabled: true
+        - Name: KnownBadInputs
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${AWS::StackName}-known-bad-inputs
+            SampledRequestsEnabled: true
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
         Enabled: true
+        WebACLId: !GetAtt ApiWebAcl.Arn
         Comment: VulnScope serverless site.
         Aliases:
           - !Ref DomainName
@@ -343,6 +413,9 @@ Resources:
             OriginAccessControlId: !Ref OriginAccessControl
           - Id: ApiGatewayOrigin
             DomainName: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref ApiOriginSecret
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               HTTPSPort: 443

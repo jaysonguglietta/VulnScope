@@ -5,11 +5,14 @@ REGION="${AWS_REGION:-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-json}"
 EXPECTED_AWS_ACCOUNT_ID="${EXPECTED_AWS_ACCOUNT_ID:-171058045575}"
 STACK_NAME="${STACK_NAME:-vulnscope-prod}"
+ARTIFACT_STACK_NAME="${ARTIFACT_STACK_NAME:-vulnscope-artifacts}"
+ARTIFACT_RETENTION_DAYS="${ARTIFACT_RETENTION_DAYS:-30}"
 DOMAIN_NAME="${DOMAIN_NAME:-vulnscope.jsontechnology.com}"
 ROOT_DOMAIN="${ROOT_DOMAIN:-jsontechnology.com}"
 NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
 MONITORED_CVES="${MONITORED_CVES:-}"
 MONITOR_SCHEDULE="${MONITOR_SCHEDULE:-rate(1 day)}"
+ORIGIN_VERIFY_SECRET="${ORIGIN_VERIFY_SECRET:-$(openssl rand -hex 32)}"
 export AWS_PROFILE
 
 if [[ "${REGION}" != "us-east-1" ]]; then
@@ -51,16 +54,14 @@ echo "  region: ${REGION}"
 echo "  domain: ${DOMAIN_NAME}"
 echo "  hosted zone: ${HOSTED_ZONE_ID}"
 
-if ! aws s3api head-bucket --bucket "${ARTIFACT_BUCKET}" >/dev/null 2>&1; then
-  aws s3api create-bucket --bucket "${ARTIFACT_BUCKET}" --region "${REGION}" >/dev/null
-  aws s3api put-public-access-block \
-    --bucket "${ARTIFACT_BUCKET}" \
-    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
-fi
-
-aws s3api put-bucket-encryption \
-  --bucket "${ARTIFACT_BUCKET}" \
-  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null
+aws cloudformation deploy \
+  --region "${REGION}" \
+  --stack-name "${ARTIFACT_STACK_NAME}" \
+  --template-file "infra/vulnscope-artifacts.yml" \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides \
+    ArtifactBucketName="${ARTIFACT_BUCKET}" \
+    ArtifactRetentionDays="${ARTIFACT_RETENTION_DAYS}"
 
 rm -rf ".deploy"
 mkdir -p "${BUILD_DIR}"
@@ -84,7 +85,8 @@ aws cloudformation deploy \
     LambdaCodeKey="${LAMBDA_CODE_KEY}" \
     NotificationEmail="${NOTIFICATION_EMAIL}" \
     MonitoredCves="${MONITORED_CVES}" \
-    MonitorScheduleExpression="${MONITOR_SCHEDULE}"
+    MonitorScheduleExpression="${MONITOR_SCHEDULE}" \
+    ApiOriginSecret="${ORIGIN_VERIFY_SECRET}"
 
 OUTPUTS="$(
   aws cloudformation describe-stacks \
