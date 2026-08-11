@@ -375,6 +375,18 @@ Resources:
             CloudWatchMetricsEnabled: true
             MetricName: !Sub ${AWS::StackName}-api-ip-rate-limit
             SampledRequestsEnabled: true
+        - Name: KnownBadInputs
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${AWS::StackName}-known-bad-inputs
+            SampledRequestsEnabled: true
 
   Distribution:
     Type: AWS::CloudFront::Distribution

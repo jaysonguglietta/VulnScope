@@ -112,4 +112,20 @@ assert.equal(inspectorReport.format, "Amazon Inspector findings");
 assert.equal(inspectorReport.findings[0].provider, "AWS");
 assert.equal(inspectorReport.findings[0].fixedVersion, "2.17.1");
 
+const expansionCves = Array.from({ length: 10 }, (_, index) => `CVE-2024-${1000 + index}`);
+const expansion = JSON.stringify({
+  findings: [{
+    severity: "HIGH",
+    resources: Array.from({ length: 10 }, (_, index) => ({ id: `arn:aws:ec2:us-east-1:123456789012:instance/i-${index}` })),
+    packageVulnerabilityDetails: {
+      vulnerabilityId: expansionCves[0],
+      relatedVulnerabilities: expansionCves.slice(1),
+      vulnerablePackages: Array.from({ length: 10 }, (_, index) => ({ name: `package-${index}`, version: "1.0.0" }))
+    }
+  }]
+});
+const boundedExpansion = parseEvidenceFile({ name: "expansion.json", size: expansion.length }, expansion, { maxOutputRecords: 75 });
+assert(boundedExpansion.findings.length + boundedExpansion.assets.length <= 75, "normalized evidence must respect the output budget");
+assert(boundedExpansion.warnings.some((warning) => warning.includes("capped")), "bounded expansion should report truncation");
+
 console.log("sbom, VEX, cloud evidence, and exposure tests passed");
