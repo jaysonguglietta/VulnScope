@@ -10,6 +10,7 @@ ROOT_DOMAIN="${ROOT_DOMAIN:-jsontechnology.com}"
 NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
 MONITORED_CVES="${MONITORED_CVES:-}"
 MONITOR_SCHEDULE="${MONITOR_SCHEDULE:-rate(1 day)}"
+ORIGIN_VERIFY_SECRET="${ORIGIN_VERIFY_SECRET:-$(openssl rand -hex 32)}"
 export AWS_PROFILE
 
 if [[ "${REGION}" != "us-east-1" ]]; then
@@ -84,7 +85,8 @@ aws cloudformation deploy \
     LambdaCodeKey="${LAMBDA_CODE_KEY}" \
     NotificationEmail="${NOTIFICATION_EMAIL}" \
     MonitoredCves="${MONITORED_CVES}" \
-    MonitorScheduleExpression="${MONITOR_SCHEDULE}"
+    MonitorScheduleExpression="${MONITOR_SCHEDULE}" \
+    ApiOriginSecret="${ORIGIN_VERIFY_SECRET}"
 
 OUTPUTS="$(
   aws cloudformation describe-stacks \

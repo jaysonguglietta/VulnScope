@@ -9,7 +9,7 @@ VulnScope uses a serverless AWS deployment for very light traffic. Authenticatio
 ```text
 Browser
   -> Route 53: vulnscope.jsontechnology.com
-  -> CloudFront: TLS, security headers, method controls
+  -> CloudFront: TLS, security headers, method controls, WAF rate limit
      -> private S3 origin: HTML, CSS, JavaScript, browser worker
      -> API Gateway HTTP API
         -> vulnscope-api Lambda
@@ -67,6 +67,8 @@ ROOT_DOMAIN=jsontechnology.com
 
 The script refuses to deploy when the resolved account differs from `EXPECTED_AWS_ACCOUNT_ID`. This prevents an accidentally selected AWS profile from creating the production names in another account.
 
+The deploy script generates a 256-bit origin-verification secret for CloudFront and Lambda. Set `ORIGIN_VERIFY_SECRET` explicitly when deployments must retain the same value; otherwise each deployment rotates it. The value is a `NoEcho` CloudFormation parameter and is never sent to the browser.
+
 The script:
 
 1. Resolves the AWS account and public Route 53 hosted zone.
@@ -118,9 +120,11 @@ Production exposes only:
 
 CloudFront requires its full seven-method origin behavior whenever `POST` is enabled. The effective application allowlist is the three explicit API Gateway routes above; `PUT`, `PATCH`, `DELETE`, and unknown paths have no API Gateway route and do not invoke the Lambda.
 
-The enrichment request is JSON and accepts no more than 200 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 120 per request, and upstream responses are capped at 8 MiB.
+The enrichment request is JSON and accepts no more than 50 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 40 per request, individual upstream responses are capped at 8 MiB, and the request has a 32 MiB aggregate response budget, 41-call budget, and 15-second outbound deadline. Warm Lambda environments cache up to 500 OSV detail records for one hour.
 
-API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
+The CloudFront WAF blocks an IP after 100 requests in a five-minute evaluation window for `/api/` paths. API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
+
+CloudFront adds `X-Origin-Verify` only on the API origin request. Lambda requires that value in AWS, preventing the documented API Gateway hostname from bypassing CloudFront and its WAF. Local and container deployments do not require the header unless `ORIGIN_VERIFY_SECRET` is configured.
 
 Lambda uses API Gateway's `requestContext.http.sourceIp` as its trusted rate-limit identity. For a local reverse-proxy deployment, forwarded addresses are accepted only when `TRUST_PROXY=1` and the direct peer is loopback.
 

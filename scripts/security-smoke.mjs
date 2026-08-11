@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
-import { buildOsvQuery } from "../server.mjs";
+import { buildOsvQuery, handleApiRequest } from "../server.mjs";
 
 const versionedPurlQuery = buildOsvQuery({
   purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
@@ -10,6 +10,17 @@ const versionedPurlQuery = buildOsvQuery({
 assert(!Object.hasOwn(versionedPurlQuery, "version"), "versioned PURLs must not duplicate the OSV version field");
 const unversionedPurlQuery = buildOsvQuery({ purl: "pkg:maven/org.example/library", version: "1.2.3" });
 assert(unversionedPurlQuery.version === "1.2.3", "unversioned PURLs should retain an explicit OSV version");
+
+process.env.ORIGIN_VERIFY_SECRET = "test-origin-secret-that-is-at-least-32-bytes";
+const deniedOrigin = await handleApiRequest({ path: "/api/health", method: "GET", headers: {} });
+assert(deniedOrigin.statusCode === 403, "configured origin verification should reject direct API requests");
+const acceptedOrigin = await handleApiRequest({
+  path: "/api/health",
+  method: "GET",
+  headers: { "x-origin-verify": process.env.ORIGIN_VERIFY_SECRET }
+});
+assert(acceptedOrigin.statusCode === 200, "configured origin verification should accept the trusted origin header");
+delete process.env.ORIGIN_VERIFY_SECRET;
 
 let child;
 const rootUrl = await startTestServer();
