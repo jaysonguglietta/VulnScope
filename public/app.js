@@ -1,4 +1,4 @@
-import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "./modules/workspace.js";
+import { buildExposureRows, summarizeExposureRows } from "./modules/workspace.js";
 
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
@@ -639,7 +639,7 @@ function clearSboms() {
 async function handleEvidenceFiles(files) {
   if (!files.length) return;
   const warnings = [];
-  const reports = [];
+  const readable = [];
   let totalBytes = 0;
   for (const file of files.slice(0, SBOM_MAX_FILES)) {
     if (file.size > SBOM_MAX_FILE_BYTES) {
@@ -652,12 +652,16 @@ async function handleEvidenceFiles(files) {
     }
     totalBytes += file.size;
     try {
-      reports.push(parseEvidenceFile(file, await file.text()));
+      readable.push({ file, text: await file.text() });
     } catch (error) {
       warnings.push(`${file.name} could not be imported: ${error.message || "browser file read failed"}.`);
     }
   }
   if (files.length > SBOM_MAX_FILES) warnings.push(`Only the first ${SBOM_MAX_FILES} evidence files were processed.`);
+  const background = await parseEvidenceInBackground(readable);
+  const reports = background?.results || [];
+  if (background?.truncated) warnings.push("The evidence batch reached the 50,000-record safety limit; remaining files were not processed.");
+  if (!background && readable.length) warnings.push("Evidence parsing timed out or the browser worker was unavailable. No files were reparsed on the main thread.");
   if (!reports.length) {
     showToast(warnings[0] || "No evidence files were imported.");
     return;
@@ -675,6 +679,32 @@ async function handleEvidenceFiles(files) {
   const findingCount = reports.reduce((count, report) => count + report.findings.length, 0);
   const vexCount = reports.reduce((count, report) => count + report.vexStatements.length, 0);
   showToast(`Imported ${reports.length} evidence file${reports.length === 1 ? "" : "s"}: ${findingCount} findings and ${vexCount} VEX statements.`);
+}
+
+async function parseEvidenceInBackground(files) {
+  if (!files.length || typeof Worker === "undefined") return null;
+  const id = globalThis.crypto?.randomUUID?.() || `evidence-${Date.now()}`;
+  const worker = new Worker("/evidence-worker.js", { type: "module" });
+  try {
+    return await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(null), 30000);
+      worker.addEventListener("message", (event) => {
+        if (event.data?.id !== id) return;
+        clearTimeout(timeout);
+        resolve(event.data.ok ? { results: event.data.results, truncated: event.data.truncated } : null);
+      }, { once: true });
+      worker.addEventListener("error", () => {
+        clearTimeout(timeout);
+        resolve(null);
+      }, { once: true });
+      worker.postMessage({
+        id,
+        files: files.map(({ file, text }) => ({ name: file.name, size: file.size, text }))
+      });
+    });
+  } finally {
+    worker.terminate();
+  }
 }
 
 function openEvidenceReport(id) {

@@ -195,7 +195,7 @@ Supported cloud and VEX inputs:
 - CSAF VEX
 - CycloneDX VEX
 
-Browser safety limits are 10 files per batch, 10 MiB per file, 40 MiB total, and 100,000 normalized parser records. JSON and text parsing runs in a Web Worker; XML uses the browser DOM parser fallback.
+Browser safety limits are 10 files per batch, 10 MiB per file, and 40 MiB total. Cloud and VEX evidence parsing runs only in a Web Worker with a 50,000-record batch budget, 10,000 source-row limit, 500-value dimension limit, 40-level nesting limit, and bounded cells/columns. Worker failure or timeout rejects evidence instead of reparsing it on the main thread. SBOM JSON and text parsing also use a worker; SBOM XML retains its browser DOM parser fallback.
 
 ## Local and Container Runs
 
