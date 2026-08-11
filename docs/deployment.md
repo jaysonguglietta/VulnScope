@@ -29,6 +29,7 @@ Raw SBOM, cloud, and VEX files remain in browser memory. The backend receives a 
 - AWS account: `171058045575`
 - Region: `us-east-1`
 - CloudFormation stack: `vulnscope-prod`
+- Artifact CloudFormation stack: `vulnscope-artifacts`
 - Hosted zone: `jsontechnology.com` / `ZE0UTGIT9KUYU`
 - Domain: `vulnscope.jsontechnology.com`
 - CloudFront distribution: `E19BTXYV3YQQSQ`
@@ -72,7 +73,7 @@ The deploy script generates a 256-bit origin-verification secret for CloudFront 
 The script:
 
 1. Resolves the AWS account and public Route 53 hosted zone.
-2. Creates or reuses the private artifact bucket and enforces AES-256 server-side encryption.
+2. Deploys `infra/vulnscope-artifacts.yml`, which owns the private, encrypted, versioned artifact bucket and its lifecycle policy.
 3. Packages `server.mjs`, `lambda.mjs`, `monitor.mjs`, production dependencies, and lock files.
 4. Uploads the immutable Lambda artifact and deploys `infra/vulnscope.yml`.
 5. Syncs `public/` to the private static bucket and invalidates CloudFront.
@@ -131,10 +132,11 @@ Lambda uses API Gateway's `requestContext.http.sourceIp` as its trusted rate-lim
 ## Storage and Retention
 
 - Static bucket: private OAC access, AES-256 encryption, versioning, noncurrent versions deleted after 7 days.
-- Artifact bucket: public access blocked, AES-256 encryption enforced by the deploy script.
+- Artifact bucket: retained CloudFormation resource with public access blocked, AES-256 encryption, ownership enforcement, versioning, incomplete-upload cleanup after 1 day, noncurrent-version cleanup after 7 days, and artifact expiration after 30 days by default.
 - Browser uploads: memory only; cleared on refresh or by the user.
 - Browser cases and watchlist: local storage; pruned after 90 days.
 - Monitor snapshots: encrypted DynamoDB; TTL after 180 days.
+- Lambda log groups: explicitly managed with 30-day retention and function-scoped write permissions.
 
 ## Production Validation
 
@@ -158,7 +160,15 @@ Validate infrastructure before deployment:
 aws cloudformation validate-template \
   --region us-east-1 \
   --template-body file://infra/vulnscope.yml
+aws cloudformation validate-template \
+  --region us-east-1 \
+  --template-body file://infra/vulnscope-artifacts.yml
 ```
+
+CI also runs pinned `cfn-lint` and Checkov versions. Checkov exceptions are kept
+in the workflow for the documented low-cost choices: no request/access logging,
+VPC, dead-letter queues, or customer-managed KMS resources. Findings outside
+that explicit list fail the infrastructure job.
 
 ## Cost Model
 
