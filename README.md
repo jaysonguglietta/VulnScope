@@ -25,7 +25,7 @@ Production: [https://vulnscope.jsontechnology.com](https://vulnscope.jsontechnol
 - Loads up to 10 SBOMs per batch and parses them in a background browser worker.
 - Supports CycloneDX JSON/XML, SPDX JSON/tag-value, Syft JSON, Grype JSON, and generic JSON/text containing CVEs.
 - Shows the exact package rows associated with an SBOM CVE and automatically checks loaded SBOMs for the CVE currently being researched.
-- Optionally enriches package URLs and ecosystems against OSV after explicit confirmation, including aliases, affected ranges, and known fixed versions.
+- Optionally enriches package URLs and ecosystems against OSV after explicit confirmation, including aliases, matching affected ranges, and package-specific fixed-version candidates with provenance.
 - Preserves CycloneDX VEX analysis and applies VEX status to exposure prioritization.
 
 ### Exposure workspace
