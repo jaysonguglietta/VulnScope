@@ -2,6 +2,23 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { parseSbomPayload } from "../public/modules/sbom-worker-core.js";
 import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "../public/modules/workspace.js";
+import { formatSafeDate, formatSafeDateTime } from "../public/modules/date.js";
+import { csvCell, neutralizeSpreadsheetFormula } from "../public/modules/csv.js";
+
+assert.equal(formatSafeDate("<img src=x onerror=alert(1)>", "en-US"), "Unknown");
+assert.equal(formatSafeDateTime("<script>alert(1)</script>", "en-US"), "Unknown");
+assert.equal(formatSafeDate("2026-08-11", "en-US"), "Aug 11, 2026");
+assert.equal(formatSafeDate("2026-02-31", "en-US"), "Unknown");
+assert.notEqual(formatSafeDateTime("2026-08-11T12:30:00Z", "en-US"), "Unknown");
+
+for (const prefix of ["=", "+", "-", "@", "\t", "\r", "  ="]) {
+  assert.equal(neutralizeSpreadsheetFormula(`${prefix}formula`).startsWith("'"), true, `CSV prefix ${JSON.stringify(prefix)} must be neutralized`);
+}
+assert.equal(csvCell("=1+1"), "'=1+1");
+assert.equal(csvCell("value,with,commas"), '"value,with,commas"');
+assert.equal(csvCell('value "quoted"'), '"value ""quoted"""');
+assert.equal(csvCell(-1), "-1", "real numeric values must remain numeric");
+assert.equal(csvCell(true), "true", "boolean values must remain typed literals");
 
 const sampleText = await readFile(new URL("fixtures/sample-cyclonedx.json", import.meta.url), "utf8");
 const result = parseSbomPayload({ name: "sample-cyclonedx.json", size: sampleText.length }, sampleText);
@@ -23,6 +40,7 @@ const openVex = JSON.stringify({
 const vexReport = parseEvidenceFile({ name: "status.openvex.json", size: openVex.length }, openVex);
 assert.equal(vexReport.format, "OpenVEX");
 assert.equal(vexReport.vexStatements[0].status, "Not affected");
+assert.equal(vexReport.vexStatements[0].trusted, false);
 
 const sbomReport = {
   title: "production-api",
@@ -41,9 +59,15 @@ const sbomReport = {
 const exposureRows = buildExposureRows({ sbomReports: [sbomReport], evidenceReports: [vexReport] });
 assert.equal(exposureRows.length, 1);
 assert.equal(exposureRows[0].vulnerability, "CVE-2021-44228");
-assert.equal(exposureRows[0].vexStatus, "Not affected");
-assert.equal(exposureRows[0].priorityScore, 0);
-assert.equal(summarizeExposureRows(exposureRows).notAffected, 1);
+assert.equal(exposureRows[0].vexStatus, "Needs verification");
+assert.notEqual(exposureRows[0].priorityScore, 0);
+assert.equal(summarizeExposureRows(exposureRows).notAffected, 0);
+
+vexReport.vexStatements[0].trusted = true;
+vexReport.vexStatements[0].trustReason = "Analyst approved during import.";
+const approvedExposureRows = buildExposureRows({ sbomReports: [sbomReport], evidenceReports: [vexReport] });
+assert.equal(approvedExposureRows[0].vexStatus, "Not affected");
+assert.equal(approvedExposureRows[0].priorityScore, 0);
 
 const isolatedProducts = buildExposureRows({
   evidenceReports: [{
@@ -56,12 +80,28 @@ const isolatedProducts = buildExposureRows({
       aliases: [],
       products: ["pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"],
       status: "Not affected",
-      justification: "Component is unreachable."
+      justification: "Component is unreachable.",
+      trusted: true,
+      trustReason: "Analyst approved during import."
     }]
   }]
 });
 assert.equal(isolatedProducts.find((row) => row.packageName === "log4j-core").vexStatus, "Not affected");
 assert.equal(isolatedProducts.find((row) => row.packageName === "unrelated-package").vexStatus, "Unknown");
+
+const substringProducts = buildExposureRows({
+  evidenceReports: [{
+    findings: [{ vulnerability: "CVE-2024-1234", packageName: "catalog" }],
+    vexStatements: [{
+      vulnerability: "CVE-2024-1234",
+      aliases: [],
+      products: ["log"],
+      status: "Not affected",
+      trusted: true
+    }]
+  }]
+});
+assert.equal(substringProducts[0].vexStatus, "Unknown", "substring product identities must not match");
 
 const inspector = JSON.stringify({
   findings: [{
@@ -78,5 +118,21 @@ const inspectorReport = parseEvidenceFile({ name: "inspector.json", size: inspec
 assert.equal(inspectorReport.format, "Amazon Inspector findings");
 assert.equal(inspectorReport.findings[0].provider, "AWS");
 assert.equal(inspectorReport.findings[0].fixedVersion, "2.17.1");
+
+const expansionCves = Array.from({ length: 10 }, (_, index) => `CVE-2024-${1000 + index}`);
+const expansion = JSON.stringify({
+  findings: [{
+    severity: "HIGH",
+    resources: Array.from({ length: 10 }, (_, index) => ({ id: `arn:aws:ec2:us-east-1:123456789012:instance/i-${index}` })),
+    packageVulnerabilityDetails: {
+      vulnerabilityId: expansionCves[0],
+      relatedVulnerabilities: expansionCves.slice(1),
+      vulnerablePackages: Array.from({ length: 10 }, (_, index) => ({ name: `package-${index}`, version: "1.0.0" }))
+    }
+  }]
+});
+const boundedExpansion = parseEvidenceFile({ name: "expansion.json", size: expansion.length }, expansion, { maxOutputRecords: 75 });
+assert(boundedExpansion.findings.length + boundedExpansion.assets.length <= 75, "normalized evidence must respect the output budget");
+assert(boundedExpansion.warnings.some((warning) => warning.includes("capped")), "bounded expansion should report truncation");
 
 console.log("sbom, VEX, cloud evidence, and exposure tests passed");

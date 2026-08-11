@@ -18,8 +18,10 @@ Do not place private source tokens in the browser bundle, commit them to Git, or
 - API Gateway supplies the trusted client address in Lambda. Public `X-Forwarded-For` values do not select the rate-limit key.
 - Static responses and API responses use CSP, frame blocking, content-type protection, referrer and permissions policies, and production HSTS.
 - Rendered source text is escaped and external links are restricted to HTTP(S).
+- CSV exports neutralize formula-leading imported text before spreadsheet use.
 - Raw SBOM, cloud, and VEX files stay in browser memory. OSV enrichment sends only package identifiers after confirmation.
 - Static and artifact buckets block public access and use server-side encryption. The static bucket uses versioning with noncurrent-version cleanup.
+- Lambda logs have explicit 30-day retention and function-scoped write permissions; deployment artifacts are managed by a retained CloudFormation stack with versioning and expiration.
 - Scheduled-monitor state is encrypted in DynamoDB and expires after 180 days.
 - Production dependencies are checked with `npm audit --omit=dev` in `npm run verify`.
 - Release actions and the production container base are immutable; release bundles include a checksum, SPDX SBOM, and GitHub-signed provenance that the deployment script verifies.

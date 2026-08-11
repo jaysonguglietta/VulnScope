@@ -9,7 +9,7 @@ VulnScope uses a serverless AWS deployment for very light traffic. Authenticatio
 ```text
 Browser
   -> Route 53: vulnscope.jsontechnology.com
-  -> CloudFront: TLS, security headers, method controls
+  -> CloudFront: TLS, security headers, method controls, WAF rate limit
      -> private S3 origin: HTML, CSS, JavaScript, browser worker
      -> API Gateway HTTP API
         -> vulnscope-api Lambda
@@ -29,6 +29,7 @@ Raw SBOM, cloud, and VEX files remain in browser memory. The backend receives a 
 - AWS account: `171058045575`
 - Region: `us-east-1`
 - CloudFormation stack: `vulnscope-prod`
+- Artifact CloudFormation stack: `vulnscope-artifacts`
 - Hosted zone: `jsontechnology.com` / `ZE0UTGIT9KUYU`
 - Domain: `vulnscope.jsontechnology.com`
 - CloudFront distribution: `E19BTXYV3YQQSQ`
@@ -82,11 +83,13 @@ ROOT_DOMAIN=jsontechnology.com
 
 The script refuses to deploy when the resolved account differs from `EXPECTED_AWS_ACCOUNT_ID`. This prevents an accidentally selected AWS profile from creating the production names in another account.
 
+The deploy script generates a 256-bit origin-verification secret for CloudFront and Lambda. Set `ORIGIN_VERIFY_SECRET` explicitly when deployments must retain the same value; otherwise each deployment rotates it. The value is a `NoEcho` CloudFormation parameter and is never sent to the browser.
+
 The script:
 
-1. Resolves the AWS account and public Route 53 hosted zone.
-2. Creates or reuses the private artifact bucket and enforces AES-256 server-side encryption.
-3. Verifies the Lambda artifact checksum and GitHub build attestation.
+1. Verifies the Lambda artifact checksum and GitHub build attestation, or packages a local build only through the explicit break-glass path.
+2. Resolves the AWS account and public Route 53 hosted zone.
+3. Deploys `infra/vulnscope-artifacts.yml`, which owns the private, encrypted, versioned artifact bucket and its lifecycle policy.
 4. Uploads the immutable Lambda artifact and deploys `infra/vulnscope.yml`.
 5. Syncs `public/` to the private static bucket and invalidates CloudFront.
 
@@ -133,19 +136,22 @@ Production exposes only:
 
 CloudFront requires its full seven-method origin behavior whenever `POST` is enabled. The effective application allowlist is the three explicit API Gateway routes above; `PUT`, `PATCH`, `DELETE`, and unknown paths have no API Gateway route and do not invoke the Lambda.
 
-The enrichment request is JSON and accepts no more than 200 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 120 per request, and upstream responses are capped at 8 MiB.
+The enrichment request is JSON and accepts no more than 50 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 40 per request, individual upstream responses are capped at 8 MiB, and the request has a 32 MiB aggregate response budget, 41-call budget, and 15-second outbound deadline. Warm Lambda environments cache up to 500 OSV detail records for one hour.
 
-API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
+The CloudFront WAF blocks an IP after 100 requests in a five-minute evaluation window for `/api/` paths. API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
+
+CloudFront adds `X-Origin-Verify` only on the API origin request. Lambda requires that value in AWS, preventing the documented API Gateway hostname from bypassing CloudFront and its WAF. Local and container deployments do not require the header unless `ORIGIN_VERIFY_SECRET` is configured.
 
 Lambda uses API Gateway's `requestContext.http.sourceIp` as its trusted rate-limit identity. For a local reverse-proxy deployment, forwarded addresses are accepted only when `TRUST_PROXY=1` and the direct peer is loopback.
 
 ## Storage and Retention
 
 - Static bucket: private OAC access, AES-256 encryption, versioning, noncurrent versions deleted after 7 days.
-- Artifact bucket: public access blocked, AES-256 encryption enforced by the deploy script.
+- Artifact bucket: retained CloudFormation resource with public access blocked, AES-256 encryption, ownership enforcement, versioning, incomplete-upload cleanup after 1 day, noncurrent-version cleanup after 7 days, and artifact expiration after 30 days by default.
 - Browser uploads: memory only; cleared on refresh or by the user.
 - Browser cases and watchlist: local storage; pruned after 90 days.
 - Monitor snapshots: encrypted DynamoDB; TTL after 180 days.
+- Lambda log groups: explicitly managed with 30-day retention and function-scoped write permissions.
 
 ## Production Validation
 
@@ -169,7 +175,15 @@ Validate infrastructure before deployment:
 aws cloudformation validate-template \
   --region us-east-1 \
   --template-body file://infra/vulnscope.yml
+aws cloudformation validate-template \
+  --region us-east-1 \
+  --template-body file://infra/vulnscope-artifacts.yml
 ```
+
+CI also runs pinned `cfn-lint` and Checkov versions. Checkov exceptions are kept
+in the workflow for the documented low-cost choices: no request/access logging,
+VPC, dead-letter queues, or customer-managed KMS resources. Findings outside
+that explicit list fail the infrastructure job.
 
 ## Cost Model
 
@@ -210,7 +224,9 @@ Supported cloud and VEX inputs:
 - CSAF VEX
 - CycloneDX VEX
 
-Browser safety limits are 10 files per batch, 10 MiB per file, 40 MiB total, and 100,000 normalized parser records. JSON and text parsing runs in a Web Worker; XML uses the browser DOM parser fallback.
+VEX is treated as unverified input. `Not affected` and `Fixed` claims apply only after the analyst approves them during import and only when the statement product exactly matches a package URL, package name, asset ID, or asset name. Ambiguous substring and productless matches never suppress an exposure.
+
+Browser safety limits are 10 files per batch, 10 MiB per file, and 40 MiB total. Cloud and VEX evidence parsing runs only in a Web Worker with a 50,000-record batch budget, 10,000 source-row limit, 500-value dimension limit, 40-level nesting limit, and bounded cells/columns. Worker failure or timeout rejects evidence instead of reparsing it on the main thread. SBOM JSON and text parsing also use a worker; SBOM XML retains its browser DOM parser fallback.
 
 ## Local and Container Runs
 

@@ -1,4 +1,6 @@
-import { buildExposureRows, parseEvidenceFile, summarizeExposureRows } from "./modules/workspace.js";
+import { buildExposureRows, summarizeExposureRows } from "./modules/workspace.js";
+import { formatSafeDate as formatDate, formatSafeDateTime as formatDateTime } from "./modules/date.js";
+import { csvCell } from "./modules/csv.js";
 
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
@@ -563,6 +565,11 @@ async function handleSbomFiles(files) {
     else parsed.push(parseSbomFile(item.file, item.text));
   }
 
+  reviewSuppressiveVexClaims(
+    parsed.flatMap((file) => file.vulnerabilities || []).map((vulnerability) => vulnerability.vex).filter(Boolean),
+    "the uploaded SBOM"
+  );
+
   if (!parsed.length) {
     showToast("No SBOM files were parsed.");
     return;
@@ -639,7 +646,7 @@ function clearSboms() {
 async function handleEvidenceFiles(files) {
   if (!files.length) return;
   const warnings = [];
-  const reports = [];
+  const readable = [];
   let totalBytes = 0;
   for (const file of files.slice(0, SBOM_MAX_FILES)) {
     if (file.size > SBOM_MAX_FILE_BYTES) {
@@ -652,17 +659,22 @@ async function handleEvidenceFiles(files) {
     }
     totalBytes += file.size;
     try {
-      reports.push(parseEvidenceFile(file, await file.text()));
+      readable.push({ file, text: await file.text() });
     } catch (error) {
       warnings.push(`${file.name} could not be imported: ${error.message || "browser file read failed"}.`);
     }
   }
   if (files.length > SBOM_MAX_FILES) warnings.push(`Only the first ${SBOM_MAX_FILES} evidence files were processed.`);
+  const background = await parseEvidenceInBackground(readable);
+  const reports = background?.results || [];
+  if (background?.truncated) warnings.push("The evidence batch reached the 50,000-record safety limit; remaining files were not processed.");
+  if (!background && readable.length) warnings.push("Evidence parsing timed out or the browser worker was unavailable. No files were reparsed on the main thread.");
   if (!reports.length) {
     showToast(warnings[0] || "No evidence files were imported.");
     return;
   }
   if (warnings.length) reports[0].warnings = [...warnings, ...(reports[0].warnings || [])];
+  reviewSuppressiveVexClaims(reports.flatMap((report) => report.vexStatements || []), "the imported VEX evidence");
   state.evidenceReports = [...reports, ...state.evidenceReports].slice(0, 12);
   state.activeEvidenceId = reports[0].id;
   state.view = "evidence";
@@ -675,6 +687,47 @@ async function handleEvidenceFiles(files) {
   const findingCount = reports.reduce((count, report) => count + report.findings.length, 0);
   const vexCount = reports.reduce((count, report) => count + report.vexStatements.length, 0);
   showToast(`Imported ${reports.length} evidence file${reports.length === 1 ? "" : "s"}: ${findingCount} findings and ${vexCount} VEX statements.`);
+}
+
+async function parseEvidenceInBackground(files) {
+  if (!files.length || typeof Worker === "undefined") return null;
+  const id = globalThis.crypto?.randomUUID?.() || `evidence-${Date.now()}`;
+  const worker = new Worker("/evidence-worker.js", { type: "module" });
+  try {
+    return await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(null), 30000);
+      worker.addEventListener("message", (event) => {
+        if (event.data?.id !== id) return;
+        clearTimeout(timeout);
+        resolve(event.data.ok ? { results: event.data.results, truncated: event.data.truncated } : null);
+      }, { once: true });
+      worker.addEventListener("error", () => {
+        clearTimeout(timeout);
+        resolve(null);
+      }, { once: true });
+      worker.postMessage({
+        id,
+        files: files.map(({ file, text }) => ({ name: file.name, size: file.size, text }))
+      });
+    });
+  } finally {
+    worker.terminate();
+  }
+}
+
+function reviewSuppressiveVexClaims(statements, sourceLabel) {
+  const suppressive = statements.filter((statement) => ["Not affected", "Fixed"].includes(statement.status));
+  if (!suppressive.length) return;
+  const approved = window.confirm(
+    `${sourceLabel} contains ${suppressive.length} suppressive VEX claim${suppressive.length === 1 ? "" : "s"}. ` +
+    "Approve these claims for exact matching products? Unapproved claims remain visible but do not lower exposure priority."
+  );
+  const reviewedAt = new Date().toISOString();
+  for (const statement of suppressive) {
+    statement.trusted = approved;
+    statement.approvedAt = approved ? reviewedAt : null;
+    statement.trustReason = approved ? "Analyst approved during import." : "Imported VEX was not approved for suppression.";
+  }
 }
 
 function openEvidenceReport(id) {
@@ -901,9 +954,9 @@ function renderExposureTable(rows) {
               <td><span class="risk-badge risk-${escapeAttr(row.priority)}">${escapeHtml(row.priority)} ${row.priorityScore}</span></td>
               <td><strong>${escapeHtml(row.vulnerability)}</strong><br><span class="muted-cell">${escapeHtml(row.severity || "Unknown")} ${row.kev ? "- KEV" : ""}${row.epss !== null ? ` - EPSS ${formatPercent(row.epss)}` : ""}</span></td>
               <td><strong>${escapeHtml(row.packageName || row.assetName || "Unmapped")}</strong><br><span class="muted-cell">${escapeHtml(row.assetName || row.assetId || row.sourceFile || row.source)}</span></td>
-              <td>${escapeHtml(row.installedVersion || "n/a")}${row.fixedVersion ? `<br><span class="fixed-version">Fix: ${escapeHtml(row.fixedVersion)}</span>` : ""}</td>
+              <td>${escapeHtml(row.installedVersion || "n/a")}${row.fixedVersions?.length ? `<br><span class="fixed-version" title="${escapeAttr(row.fixProvenance?.map((item) => `${item.package}: ${item.version}`).join("; ") || "OSV package-specific fix candidates")}">Fix: ${escapeHtml(row.fixedVersions.join(" or "))}</span>` : ""}</td>
               <td>${escapeHtml(row.provider || row.source)}<br><span class="muted-cell">${escapeHtml(row.exploitStatus || "Unknown")}</span></td>
-              <td><span class="vex-badge vex-${escapeAttr(classToken(row.vexStatus))}">${escapeHtml(row.vexStatus)}</span>${row.vexJustification ? `<br><span class="muted-cell" title="${escapeAttr(row.vexJustification)}">${escapeHtml(row.vexJustification.slice(0, 90))}</span>` : ""}</td>
+              <td><span class="vex-badge vex-${escapeAttr(classToken(row.vexStatus))}">${escapeHtml(row.vexStatus)}</span><br><span class="muted-cell" title="${escapeAttr(row.vexTrustReason)}">${row.vexTrusted ? "Analyst approved" : `Unverified claim: ${escapeHtml(row.vexClaimedStatus)}`}</span>${row.vexJustification ? `<br><span class="muted-cell" title="${escapeAttr(row.vexJustification)}">${escapeHtml(row.vexJustification.slice(0, 90))}</span>` : ""}</td>
               <td>${/^CVE-\d{4}-\d{4,}$/.test(row.vulnerability) ? `<button class="secondary-button table-button" type="button" data-action="research-exposure" data-value="${escapeAttr(row.vulnerability)}">Research</button>` : `<span class="muted-cell">Advisory only</span>`}</td>
             </tr>
           `).join("")}
@@ -924,14 +977,9 @@ function exportExposureCsv() {
     showToast("No exposure rows to export.");
     return;
   }
-  const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Justification", "Owner", "Workflow Status"];
-  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexJustification, row.owner, row.workflowStatus]);
+  const headers = ["Priority", "Score", "Vulnerability", "Severity", "KEV", "EPSS", "Package", "Installed Version", "Fixed Version", "Provider", "Asset ID", "Asset Name", "Source", "VEX Status", "VEX Claimed Status", "VEX Trust", "VEX Justification", "Owner", "Workflow Status"];
+  const values = rows.map((row) => [row.priority, row.priorityScore, row.vulnerability, row.severity, row.kev, row.epss ?? "", row.packageName, row.installedVersion, row.fixedVersions?.join(" or ") || row.fixedVersion, row.provider, row.assetId, row.assetName, row.source, row.vexStatus, row.vexClaimedStatus, row.vexTrusted ? row.vexTrustReason : `Unverified: ${row.vexTrustReason}`, row.vexJustification, row.owner, row.workflowStatus]);
   download("vulnscope-exposure-register.csv", [headers, ...values].map((record) => record.map(csvCell).join(",")).join("\n"), "text/csv");
-}
-
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function openBulkWorkspace() {
@@ -1774,9 +1822,10 @@ function renderVexStatements(statements) {
   if (!statements.length) return `<p>No VEX statements were found in this file.</p>`;
   return `<div class="card-grid">${statements.slice(0, 100).map((statement) => `
     <div class="action-item">
-      <div class="badge-row"><span class="badge">${escapeHtml(statement.vulnerability)}</span><span class="vex-badge">${escapeHtml(statement.status)}</span></div>
+      <div class="badge-row"><span class="badge">${escapeHtml(statement.vulnerability)}</span><span class="vex-badge">${escapeHtml(statement.status)}</span><span class="badge">${statement.trusted ? "Analyst approved" : "Unverified"}</span></div>
       <strong>${escapeHtml(statement.products.join(", ") || "All referenced products")}</strong>
       <p>${escapeHtml(statement.justification || statement.impact || statement.detail || "No justification supplied.")}</p>
+      <p class="muted-cell">${escapeHtml(statement.trustReason)}</p>
       ${statement.action ? `<p><strong>Action:</strong> ${escapeHtml(statement.action)}</p>` : ""}
     </div>
   `).join("")}</div>${statements.length > 100 ? `<p class="table-note">Showing the first 100 VEX statements.</p>` : ""}`;
@@ -1840,7 +1889,7 @@ function renderMetrics(item) {
       <div class="metric-card">
         <div class="metric-label">CISA KEV</div>
         <div class="metric-value">${kev?.listed ? "Listed" : "No"}</div>
-        <div class="metric-detail">${kev?.dueDate ? `Due ${formatDate(kev.dueDate)}` : "Current catalog check"}</div>
+        <div class="metric-detail">${kev?.dueDate ? `Due ${escapeHtml(formatDate(kev.dueDate))}` : "Current catalog check"}</div>
       </div>
       <div class="metric-card">
         <div class="metric-label">Chatter</div>
@@ -2257,7 +2306,7 @@ function renderEvidenceCard(entry) {
         <h3>${escapeHtml(entry.title)}</h3>
         <p>${escapeHtml(entry.description || "No description supplied by this source.")}</p>
         <div class="evidence-meta">
-          ${entry.date ? `<span class="badge">${formatDate(entry.date)}</span>` : ""}
+          ${entry.date ? `<span class="badge">${escapeHtml(formatDate(entry.date))}</span>` : ""}
           ${(entry.tags || []).slice(0, 6).map((tag) => `<span class="badge">${escapeHtml(tag)}</span>`).join("")}
         </div>
       </div>
@@ -2276,7 +2325,7 @@ function renderTimeline(item) {
                 .map(
                   (event) => `
                     <div class="timeline-item">
-                      <div class="timeline-date">${event.date ? formatDate(event.date) : "Undated"}</div>
+                      <div class="timeline-date">${event.date ? escapeHtml(formatDate(event.date)) : "Undated"}</div>
                       <div>
                         <strong>${escapeHtml(event.label)}</strong>
                         <p>${escapeHtml(event.source)}${event.detail ? ` - ${escapeHtml(event.detail)}` : ""}</p>
@@ -2343,7 +2392,7 @@ function renderRemediation(item) {
                 <span class="badge">${escapeHtml(step.priority)}</span>
                 <strong>${escapeHtml(step.title)}</strong>
                 <p>${escapeHtml(step.detail)}</p>
-                ${step.dueDate ? `<p><strong>Due:</strong> ${formatDate(step.dueDate)}</p>` : ""}
+                ${step.dueDate ? `<p><strong>Due:</strong> ${escapeHtml(formatDate(step.dueDate))}</p>` : ""}
               </div>
             `
           )
@@ -2538,8 +2587,8 @@ function renderWatchRecord(record) {
   const latestTime = record.latest?.checkedAt || record.lastCheckedAt;
   return `
     <div class="card-grid">
-      <div class="action-item"><span class="badge">Baseline</span><strong>${formatDateTime(baselineTime)}</strong><p>${escapeHtml(record.baseline?.verdict || "Unknown")} / ${escapeHtml(record.baseline?.maturity || "Unknown")}</p></div>
-      <div class="action-item"><span class="badge">Latest check</span><strong>${formatDateTime(latestTime)}</strong><p>${escapeHtml(record.latest?.verdict || "Unknown")} / ${escapeHtml(record.latest?.maturity || "Unknown")}</p></div>
+      <div class="action-item"><span class="badge">Baseline</span><strong>${escapeHtml(formatDateTime(baselineTime))}</strong><p>${escapeHtml(record.baseline?.verdict || "Unknown")} / ${escapeHtml(record.baseline?.maturity || "Unknown")}</p></div>
+      <div class="action-item"><span class="badge">Latest check</span><strong>${escapeHtml(formatDateTime(latestTime))}</strong><p>${escapeHtml(record.latest?.verdict || "Unknown")} / ${escapeHtml(record.latest?.maturity || "Unknown")}</p></div>
     </div>
     <div class="timeline-list watch-change-list">
       ${changes.length ? changes.map((change) => `<div class="timeline-item"><div class="timeline-date">Changed</div><div><strong>${escapeHtml(change.label)}</strong><p>${escapeHtml(change.before)} -> ${escapeHtml(change.after)}</p></div></div>`).join("") : `<div class="timeline-item"><div class="timeline-date">Stable</div><div><strong>No tracked changes since last refresh</strong><p>KEV, EPSS, exploit maturity, risk, chatter, and evidence counts are unchanged.</p></div></div>`}
@@ -2658,7 +2707,7 @@ function renderSbomList() {
       <div class="case-meta">
         <span>${report.components.length} components</span>
         <span>${report.cves.length} CVEs</span>
-        <span>${formatDate(report.uploadedAt)}</span>
+        <span>${escapeHtml(formatDate(report.uploadedAt))}</span>
       </div>
     </button>
   `).join("");
@@ -2743,7 +2792,7 @@ function renderSbomEnrichment(report) {
     return `<section class="panel enrichment-panel"><div class="panel-title-row"><div><h3>Package vulnerability enrichment</h3><p>Not run. The uploaded file remains local; choosing online enrichment sends only supported package identifiers to OSV.</p></div><span class="badge">Opt-in</span></div></section>`;
   }
   const matchedPackages = enrichment.packages.filter((pkg) => pkg.vulnerabilities?.length).length;
-  return `<section class="panel enrichment-panel found"><div class="panel-title-row"><div><h3>OSV package enrichment</h3><p>${matchedPackages} of ${enrichment.packageCount} queried packages matched ${enrichment.vulnerabilityCount} vulnerability records.${enrichment.truncated ? " Results were capped; split the SBOM for additional detail." : ""}</p></div><span class="badge">${formatDateTime(enrichment.generatedAt)}</span></div></section>`;
+  return `<section class="panel enrichment-panel found"><div class="panel-title-row"><div><h3>OSV package enrichment</h3><p>${matchedPackages} of ${enrichment.packageCount} queried packages matched ${enrichment.vulnerabilityCount} vulnerability records.${enrichment.truncated ? " Results were capped; split the SBOM for additional detail." : ""}</p></div><span class="badge">${escapeHtml(formatDateTime(enrichment.generatedAt))}</span></div></section>`;
 }
 
 function renderSbomWarnings(report) {
@@ -2933,7 +2982,7 @@ function renderCases() {
           <div class="case-meta">
             <span>${escapeHtml(item.riskLevel)} ${item.riskScore}</span>
             <span>${escapeHtml(item.status)}</span>
-            <span>${formatDate(item.savedAt)}</span>
+            <span>${escapeHtml(formatDate(item.savedAt))}</span>
           </div>
         </button>
       `
@@ -3567,35 +3616,6 @@ function safeExternalUrl(value) {
 function formatPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "n/a";
   return `${(Number(value) * 100).toFixed(Number(value) < 0.01 ? 3 : 1)}%`;
-}
-
-function formatDate(value) {
-  if (!value) return "Unknown";
-  const date = parseDisplayDate(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" }).format(date);
-}
-
-function formatDateTime(value) {
-  if (!value) return "Unknown";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit"
-  }).format(date);
-}
-
-function parseDisplayDate(value) {
-  const text = String(value);
-  const dateOnly = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (dateOnly) {
-    return new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]));
-  }
-  return new Date(text);
 }
 
 function evidencePriority(item) {
