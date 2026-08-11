@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add bounded public GitHub dependency-graph scanning with OSV CVE matching.
+- Fall back to bounded public lockfile inspection when GitHub's generated SBOM is unavailable.
+- Add analyst confirmation, duplicate checks, prefilled issue drafts, and direct
+  GitHub issue publishing with an ephemeral fine-grained token.
+
 ## 0.3.0 - 2026-08-11
 
 Security hardening release for VulnScope's public research API, browser evidence

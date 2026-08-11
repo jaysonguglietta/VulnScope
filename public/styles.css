@@ -970,6 +970,45 @@ a:hover {
   align-items: center;
 }
 
+.github-scan-form {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.github-findings-table {
+  min-width: 980px;
+}
+
+.github-findings-table th:first-child,
+.github-findings-table td:first-child {
+  width: 76px;
+  text-align: center;
+}
+
+.github-findings-table input[type="checkbox"],
+.confirmation-check input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--teal);
+}
+
+.confirmation-check {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+}
+
+.github-publish-panel .toolbar {
+  gap: 12px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1200,6 +1239,7 @@ tr:last-child td {
   .timeline-item,
   .two-col,
   .link-grid,
+  .github-scan-form,
   .real-world-header,
   .signal-grid {
     grid-template-columns: 1fr;

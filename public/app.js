@@ -1,6 +1,7 @@
 import { buildExposureRows, summarizeExposureRows } from "./modules/workspace.js";
 import { formatSafeDate as formatDate, formatSafeDateTime as formatDateTime } from "./modules/date.js";
 import { csvCell } from "./modules/csv.js";
+import { buildGitHubIssueDraft, buildRepositoryCveFindings } from "./modules/github.js";
 
 const APP_SCHEMA_VERSION = 3;
 const STORAGE_RETENTION_DAYS = 90;
@@ -35,6 +36,14 @@ const state = {
   bulkInput: "",
   bulkQueue: [],
   bulkRunning: false,
+  githubRepositoryUrl: "",
+  githubScan: null,
+  githubSelectedCves: [],
+  githubIssueReview: false,
+  githubIssueResults: [],
+  githubScanError: "",
+  githubScanning: false,
+  githubPublishing: false,
   enriching: false,
   sourceHealth: [],
   loading: false
@@ -142,6 +151,26 @@ document.addEventListener("click", (event) => {
     case "open-bulk":
       openBulkWorkspace();
       break;
+    case "open-github-scan":
+      openGitHubRepositoryWorkspace();
+      break;
+    case "reset-github-scan":
+      resetGitHubRepositoryScan();
+      break;
+    case "review-github-issues":
+      reviewGitHubIssues();
+      break;
+    case "back-github-results":
+      state.githubIssueReview = false;
+      state.githubIssueResults = [];
+      renderGitHubRepositoryWorkspace();
+      break;
+    case "publish-github-issues":
+      publishGitHubIssues();
+      break;
+    case "select-all-github-findings":
+      selectAllGitHubFindings();
+      break;
     case "open-evidence":
       openEvidenceReport(value);
       break;
@@ -246,6 +275,24 @@ document.addEventListener("change", (event) => {
     state.exposureProvider = event.target.value;
     renderExposureWorkspace();
   }
+  if (event.target.matches("[data-github-cve]")) {
+    const cve = event.target.dataset.githubCve;
+    if (event.target.checked && !state.githubSelectedCves.includes(cve) && state.githubSelectedCves.length >= 10) {
+      event.target.checked = false;
+      showToast("Review and publish up to 10 CVEs at a time.");
+      return;
+    }
+    state.githubSelectedCves = event.target.checked
+      ? [...new Set([...state.githubSelectedCves, cve])]
+      : state.githubSelectedCves.filter((value) => value !== cve);
+    updateGitHubSelectionControls();
+  }
+});
+
+document.addEventListener("submit", (event) => {
+  if (!event.target.matches("#githubRepositoryScanForm")) return;
+  event.preventDefault();
+  scanGitHubRepository();
 });
 
 document.addEventListener("input", (event) => {
@@ -266,6 +313,10 @@ document.addEventListener("input", (event) => {
   }
   if (event.target.matches("#bulkCves")) {
     state.bulkInput = event.target.value;
+    return;
+  }
+  if (event.target.matches("#githubRepositoryUrl")) {
+    state.githubRepositoryUrl = event.target.value;
     return;
   }
   if (!state.current) return;
@@ -1106,6 +1157,334 @@ function clearBulkResearch() {
   showToast("Bulk research results cleared.");
 }
 
+function openGitHubRepositoryWorkspace() {
+  state.view = "github";
+  state.current = null;
+  state.activeSbomId = null;
+  state.activeEvidenceId = null;
+  elements.input.value = "";
+  render();
+}
+
+function resetGitHubRepositoryScan() {
+  state.githubScan = null;
+  state.githubSelectedCves = [];
+  state.githubIssueReview = false;
+  state.githubIssueResults = [];
+  state.githubScanError = "";
+  renderGitHubRepositoryWorkspace();
+}
+
+async function scanGitHubRepository() {
+  if (state.githubScanning) return;
+  const url = String(document.querySelector("#githubRepositoryUrl")?.value || state.githubRepositoryUrl).trim();
+  state.githubRepositoryUrl = url;
+  state.githubScanError = "";
+  if (!/^https:\/\/github\.com\/[a-z0-9-]+\/[a-z0-9._-]+(?:\.git)?\/?$/i.test(url)) {
+    state.githubScanError = "Enter a public repository URL such as https://github.com/owner/repository.";
+    renderGitHubRepositoryWorkspace();
+    document.querySelector("#githubRepositoryUrl")?.focus();
+    return;
+  }
+  state.githubScanning = true;
+  state.githubScan = null;
+  state.githubSelectedCves = [];
+  state.githubIssueReview = false;
+  state.githubIssueResults = [];
+  renderGitHubRepositoryWorkspace();
+  try {
+    const response = await fetch("/api/github/scan", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || "Repository scan failed.");
+    state.githubScan = {
+      ...payload,
+      findings: buildRepositoryCveFindings(payload)
+    };
+    mergeSourceHealth(payload.sourceResults);
+    showToast(`Repository scan complete: ${state.githubScan.findings.length} CVE match${state.githubScan.findings.length === 1 ? "" : "es"}.`);
+  } catch (error) {
+    state.githubScanError = error.message || "Repository scan failed.";
+  } finally {
+    state.githubScanning = false;
+    renderGitHubRepositoryWorkspace();
+    focusContent();
+  }
+}
+
+function reviewGitHubIssues() {
+  const findings = state.githubScan?.findings || [];
+  state.githubSelectedCves = state.githubSelectedCves.filter((cve) => findings.some((finding) => finding.cve === cve)).slice(0, 10);
+  if (!state.githubSelectedCves.length) {
+    showToast("Select at least one CVE to review.");
+    return;
+  }
+  state.githubIssueReview = true;
+  state.githubIssueResults = [];
+  renderGitHubRepositoryWorkspace();
+  focusContent();
+}
+
+function selectAllGitHubFindings() {
+  const all = (state.githubScan?.findings || []).filter((finding) => !finding.withdrawn).slice(0, 10).map((finding) => finding.cve);
+  state.githubSelectedCves = all.every((cve) => state.githubSelectedCves.includes(cve)) ? [] : all;
+  renderGitHubRepositoryWorkspace();
+}
+
+function updateGitHubSelectionControls() {
+  const count = state.githubSelectedCves.length;
+  const reviewButton = document.querySelector("[data-action='review-github-issues']");
+  if (reviewButton) {
+    reviewButton.disabled = count === 0;
+    reviewButton.textContent = count ? `Review ${count} issue${count === 1 ? "" : "s"}` : "Review selected";
+  }
+  document.querySelectorAll("[data-github-cve]").forEach((checkbox) => {
+    checkbox.disabled = checkbox.dataset.githubWithdrawn === "true" || (count >= 10 && !checkbox.checked);
+  });
+}
+
+async function publishGitHubIssues() {
+  if (state.githubPublishing || !state.githubScan?.repository) return;
+  const tokenInput = document.querySelector("#githubIssueToken");
+  const consent = document.querySelector("#githubIssueConsent");
+  const token = String(tokenInput?.value || "").trim();
+  if (!state.githubScan.repository.issuesEnabled) {
+    showToast("GitHub Issues are disabled for this repository.");
+    return;
+  }
+  if (!consent?.checked) {
+    showToast("Confirm the reviewed CVE matches before publishing issues.");
+    consent?.focus();
+    return;
+  }
+  if (token.length < 20 || token.length > 500 || /\s/.test(token)) {
+    showToast("Enter a valid fine-grained GitHub token with Issues write permission.");
+    tokenInput?.focus();
+    return;
+  }
+  const drafts = selectedGitHubIssueDrafts();
+  if (!drafts.length) return;
+  if (!window.confirm(`Create ${drafts.length} issue${drafts.length === 1 ? "" : "s"} in ${state.githubScan.repository.fullName}? Existing CVE issues will be skipped.`)) return;
+
+  state.githubPublishing = true;
+  state.githubIssueResults = [];
+  renderGitHubRepositoryWorkspace();
+  const repository = state.githubScan.repository;
+  for (const draft of drafts) {
+    try {
+      const existing = await findExistingGitHubIssue(repository, draft.cve, token);
+      if (existing) {
+        state.githubIssueResults.push({ cve: draft.cve, status: "Existing", url: existing.html_url, number: existing.number, message: "Matching issue already exists." });
+      } else {
+        const created = await githubApiRequest(`https://api.github.com/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/issues`, token, {
+          method: "POST",
+          body: JSON.stringify({ title: draft.title, body: draft.body })
+        });
+        state.githubIssueResults.push({ cve: draft.cve, status: "Created", url: created.html_url, number: created.number, message: "Issue created." });
+      }
+    } catch (error) {
+      state.githubIssueResults.push({ cve: draft.cve, status: "Failed", url: "", number: null, message: error.message || "GitHub issue creation failed." });
+    }
+    renderGitHubRepositoryWorkspace();
+    await delay(750);
+  }
+  state.githubPublishing = false;
+  renderGitHubRepositoryWorkspace();
+  const createdCount = state.githubIssueResults.filter((result) => result.status === "Created").length;
+  showToast(`GitHub issue publishing complete: ${createdCount} created, ${state.githubIssueResults.length - createdCount} skipped or failed.`);
+}
+
+async function findExistingGitHubIssue(repository, cve, token) {
+  const query = `repo:${repository.fullName} is:issue in:title \"${cve}\"`;
+  const result = await githubApiRequest(`https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=5`, token);
+  return (result.items || []).find((item) => String(item.title || "").toUpperCase().includes(cve)) || null;
+}
+
+async function githubApiRequest(url, token, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "x-github-api-version": "2026-03-10",
+      ...(options.body ? { "content-type": "application/json" } : {})
+    },
+    credentials: "omit",
+    referrerPolicy: "no-referrer"
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = response.status === 401
+      ? "GitHub rejected the token."
+      : response.status === 403
+        ? "The token lacks Issues write permission or GitHub rate-limited the request."
+        : response.status === 410
+          ? "GitHub Issues are disabled for this repository."
+          : response.status === 422
+            ? "GitHub rejected the issue content or repository selection."
+            : `GitHub returned HTTP ${response.status}.`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function selectedGitHubIssueDrafts() {
+  const selected = new Set(state.githubSelectedCves);
+  return (state.githubScan?.findings || [])
+    .filter((finding) => selected.has(finding.cve))
+    .slice(0, 10)
+    .map((finding) => buildGitHubIssueDraft(finding, state.githubScan.repository, state.githubScan.generatedAt));
+}
+
+function renderGitHubRepositoryWorkspace() {
+  if (state.githubIssueReview && state.githubScan) {
+    renderGitHubIssueReview();
+    return;
+  }
+  const scan = state.githubScan;
+  const repository = scan?.repository;
+  const findings = scan?.findings || [];
+  const inventorySource = scan?.sourceResults?.find((result) => result.id === "githubSbom");
+  const vulnerablePackages = new Set(findings.flatMap((finding) => finding.packages.map((pkg) => pkg.key))).size;
+  elements.content.innerHTML = `
+    <article class="investigation github-workspace">
+      <section class="brief-header">
+        <div class="brief-title">
+          <div class="badge-row">
+            <span class="badge">Public repository</span>
+            <span class="badge">Dependency CVEs</span>
+            ${repository?.archived ? `<span class="badge">Archived</span>` : ""}
+          </div>
+          <h2>${escapeHtml(repository?.fullName || "Scan a GitHub repository")}</h2>
+          <p>${escapeHtml(repository?.description || "Analyze exact repository dependency versions against OSV and promote reviewed CVE matches into GitHub issues.")}</p>
+        </div>
+        <div class="header-actions">
+          ${repository ? `<a class="secondary-button" href="${escapeAttr(safeExternalUrl(repository.url))}" target="_blank" rel="noreferrer noopener">Open repository</a>` : ""}
+          ${scan ? `<button class="secondary-button" type="button" data-action="reset-github-scan">New scan</button>` : ""}
+        </div>
+      </section>
+
+      <section class="panel github-scan-panel">
+        <form id="githubRepositoryScanForm" class="github-scan-form" novalidate>
+          <div class="search-field">
+            <label class="field-label" for="githubRepositoryUrl">Public GitHub repository URL</label>
+            <input id="githubRepositoryUrl" class="input" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://github.com/owner/repository" value="${escapeAttr(state.githubRepositoryUrl)}" aria-invalid="${state.githubScanError ? "true" : "false"}" aria-describedby="githubRepositoryError" ${state.githubScanning ? "disabled" : ""}>
+            <div id="githubRepositoryError" class="field-error" role="alert" ${state.githubScanError ? "" : "hidden"}>${escapeHtml(state.githubScanError)}</div>
+          </div>
+          <button class="primary-button" type="submit" ${state.githubScanning ? "disabled" : ""}>${state.githubScanning ? "Scanning..." : "Scan repository"}</button>
+        </form>
+      </section>
+
+      ${state.githubScanning ? renderGitHubScanLoading() : scan ? `
+        <section class="metric-grid" aria-label="Repository scan metrics">
+          <div class="metric-card"><div class="metric-label">Dependencies</div><div class="metric-value">${scan.inventory?.discoveredPackageCount || 0}</div><div class="metric-detail">${escapeHtml(inventorySource?.label || "GitHub repository inventory")}</div></div>
+          <div class="metric-card"><div class="metric-label">Scanned</div><div class="metric-value">${scan.inventory?.scannedPackageCount || 0}</div><div class="metric-detail">Versioned OSV queries</div></div>
+          <div class="metric-card"><div class="metric-label">Vulnerable packages</div><div class="metric-value">${vulnerablePackages}</div><div class="metric-detail">Package-version matches</div></div>
+          <div class="metric-card"><div class="metric-label">Known CVEs</div><div class="metric-value">${findings.length}</div><div class="metric-detail">Ready for analyst review</div></div>
+        </section>
+        ${scan.truncated ? `<div class="stale-banner"><div><strong>Scan incomplete</strong><p>A repository file, package set, or vulnerability detail exceeded a scan boundary. Review source health, split the inventory, or upload a generated SBOM for broader coverage.</p></div></div>` : ""}
+        <section class="panel">
+          <div class="panel-title-row">
+            <div><h3>Dependency CVE matches</h3><p>Confirm only findings that apply to the repository and its deployed artifacts.</p></div>
+            <div class="toolbar-group">
+              <button class="secondary-button" type="button" data-action="select-all-github-findings" ${findings.length ? "" : "disabled"}>Select first 10</button>
+              <button class="primary-button" type="button" data-action="review-github-issues" ${state.githubSelectedCves.length ? "" : "disabled"}>${state.githubSelectedCves.length ? `Review ${state.githubSelectedCves.length} issue${state.githubSelectedCves.length === 1 ? "" : "s"}` : "Review selected"}</button>
+            </div>
+          </div>
+          ${renderGitHubFindingTable(findings)}
+        </section>
+      ` : ""}
+    </article>
+  `;
+}
+
+function renderGitHubScanLoading() {
+  return `<section class="loading" aria-label="Scanning repository"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></section>`;
+}
+
+function renderGitHubFindingTable(findings) {
+  if (!findings.length) return `<div class="workspace-empty"><strong>No CVE matches found</strong><p>No versioned dependency returned a CVE alias from OSV within the scan limits.</p></div>`;
+  return `
+    <div class="table-wrap">
+      <table class="github-findings-table">
+        <thead><tr><th scope="col">Confirm</th><th scope="col">CVE</th><th scope="col">Severity</th><th scope="col">Affected dependencies</th><th scope="col">Known fixes</th><th scope="col">OSV records</th></tr></thead>
+        <tbody>${findings.slice(0, 100).map((finding) => `
+          <tr class="${state.githubSelectedCves.includes(finding.cve) ? "selected-row" : ""}">
+            <td><input type="checkbox" data-github-cve="${escapeAttr(finding.cve)}" data-github-withdrawn="${finding.withdrawn ? "true" : "false"}" aria-label="Confirm ${escapeAttr(finding.cve)}" ${state.githubSelectedCves.includes(finding.cve) ? "checked" : ""} ${finding.withdrawn || (state.githubSelectedCves.length >= 10 && !state.githubSelectedCves.includes(finding.cve)) ? "disabled" : ""}></td>
+            <td><button class="link-button" type="button" data-action="research-exposure" data-value="${escapeAttr(finding.cve)}">${escapeHtml(finding.cve)}</button>${finding.withdrawn ? `<br><span class="muted-cell">Withdrawn</span>` : ""}</td>
+            <td><span class="risk-badge risk-${escapeAttr(severityRiskClass(finding.severity))}">${escapeHtml(finding.severity)}</span></td>
+            <td>${finding.packages.slice(0, 3).map((pkg) => `<strong>${escapeHtml(pkg.name)}@${escapeHtml(pkg.version)}</strong>`).join("<br>")}${finding.packages.length > 3 ? `<br><span class="muted-cell">+${finding.packages.length - 3} more</span>` : ""}</td>
+            <td>${escapeHtml(uniqueValues(finding.packages.flatMap((pkg) => pkg.fixedVersions || [])).join(" or ") || "Not reported")}</td>
+            <td>${escapeHtml(finding.advisoryIds.join(", ") || "Unknown")}</td>
+          </tr>
+        `).join("")}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderGitHubIssueReview() {
+  const repository = state.githubScan.repository;
+  const drafts = selectedGitHubIssueDrafts();
+  elements.content.innerHTML = `
+    <article class="investigation github-workspace">
+      <section class="brief-header">
+        <div class="brief-title">
+          <div class="badge-row"><span class="badge">Issue review</span><span class="badge">${drafts.length} confirmed CVE${drafts.length === 1 ? "" : "s"}</span></div>
+          <h2>${escapeHtml(repository.fullName)}</h2>
+          <p>Review the generated issue titles and dependency evidence before publishing.</p>
+        </div>
+        <div class="header-actions"><button class="secondary-button" type="button" data-action="back-github-results" ${state.githubPublishing ? "disabled" : ""}>Back to findings</button></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title-row"><div><h3>Issue drafts</h3><p>One issue is generated per confirmed CVE and groups every matched dependency.</p></div></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>CVE</th><th>Issue title</th><th>Packages</th><th>Manual fallback</th></tr></thead><tbody>
+            ${drafts.map((draft) => {
+              const finding = state.githubScan.findings.find((item) => item.cve === draft.cve);
+              return `<tr><td><strong>${escapeHtml(draft.cve)}</strong></td><td>${escapeHtml(draft.title)}</td><td>${finding?.packages.length || 0}</td><td><a class="secondary-button table-button" href="${escapeAttr(draft.draftUrl)}" target="_blank" rel="noreferrer noopener">Open draft</a></td></tr>`;
+            }).join("")}
+          </tbody></table>
+        </div>
+      </section>
+
+      <section class="panel github-publish-panel">
+        <div class="panel-title-row"><div><h3>Publish to GitHub</h3><p>The token is sent directly to api.github.com and is not stored or sent to VulnScope.</p></div><span class="badge">Issues: write</span></div>
+        ${repository.issuesEnabled ? `
+          <div class="form-grid">
+            <div class="search-field">
+              <label class="field-label" for="githubIssueToken">Fine-grained GitHub token</label>
+              <input id="githubIssueToken" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_..." ${state.githubPublishing ? "disabled" : ""}>
+            </div>
+            <label class="confirmation-check"><input id="githubIssueConsent" type="checkbox" ${state.githubPublishing ? "disabled" : ""}> <span>I reviewed these dependency matches and confirm they should be filed as repository issues.</span></label>
+            <div class="toolbar"><span class="field-hint">Use a repository-scoped token with only Issues write permission.</span><button class="primary-button" type="button" data-action="publish-github-issues" ${state.githubPublishing ? "disabled" : ""}>${state.githubPublishing ? "Publishing..." : `Publish ${drafts.length} issue${drafts.length === 1 ? "" : "s"}`}</button></div>
+          </div>
+        ` : `<div class="error-panel">GitHub Issues are disabled for this repository. Use the issue drafts in another tracking system.</div>`}
+      </section>
+      ${renderGitHubIssueResults()}
+    </article>
+  `;
+}
+
+function renderGitHubIssueResults() {
+  if (!state.githubIssueResults.length) return "";
+  return `<section class="panel"><div class="panel-title-row"><div><h3>Publishing results</h3><p>Duplicate CVE titles are skipped before creation.</p></div></div><div class="evidence-list">${state.githubIssueResults.map((result) => `
+    <div class="evidence-card"><div><h3>${escapeHtml(result.cve)} - ${escapeHtml(result.status)}</h3><p>${escapeHtml(result.message)}</p></div>${result.url ? `<a class="secondary-button" href="${escapeAttr(safeExternalUrl(result.url))}" target="_blank" rel="noreferrer noopener">Issue #${escapeHtml(String(result.number))}</a>` : ""}</div>
+  `).join("")}</div></section>`;
+}
+
+function severityRiskClass(severity) {
+  return { CRITICAL: "Critical", HIGH: "High", MODERATE: "Elevated", MEDIUM: "Elevated", LOW: "Watch", UNKNOWN: "Watch" }[String(severity || "UNKNOWN").toUpperCase()] || "Watch";
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function copyMonitorConfiguration() {
   const cves = uniqueValues(state.watchlist.map((item) => item.id));
   if (!cves.length) {
@@ -1686,6 +2065,11 @@ function clearLocalData() {
   state.evidenceReports = [];
   state.bulkQueue = [];
   state.bulkInput = "";
+  state.githubScan = null;
+  state.githubSelectedCves = [];
+  state.githubIssueReview = false;
+  state.githubIssueResults = [];
+  state.githubScanError = "";
   state.activeSbomId = null;
   state.activeSbomCveId = null;
   state.activeEvidenceId = null;
@@ -1722,6 +2106,10 @@ function render() {
   }
   if (state.view === "bulk") {
     renderBulkWorkspace();
+    return;
+  }
+  if (state.view === "github") {
+    renderGitHubRepositoryWorkspace();
     return;
   }
   if (state.view === "evidence") {

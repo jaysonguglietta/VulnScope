@@ -1,7 +1,88 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
-import { buildOsvQuery, handleApiRequest, normalizeOsvVulnerability } from "../server.mjs";
+import { buildOsvQuery, extractGitHubLockfilePackages, extractGitHubSbomPackages, handleApiRequest, normalizeGitHubRepositoryUrl, normalizeOsvVulnerability } from "../server.mjs";
+import { buildGitHubIssueDraft, buildRepositoryCveFindings } from "../public/modules/github.js";
+
+const normalizedRepository = normalizeGitHubRepositoryUrl("https://github.com/openai/openai-node.git/");
+assert(normalizedRepository?.fullName === "openai/openai-node", "canonical public GitHub repository URLs should normalize");
+for (const rejectedUrl of [
+  "http://github.com/openai/openai-node",
+  "https://github.com.evil.example/openai/openai-node",
+  "https://user:token@github.com/openai/openai-node",
+  "https://github.com/openai/openai-node/issues",
+  "https://github.com/openai/openai-node?tab=readme"
+]) {
+  assert(normalizeGitHubRepositoryUrl(rejectedUrl) === null, `unsafe repository URL must be rejected: ${rejectedUrl}`);
+}
+
+const githubSbomInventory = extractGitHubSbomPackages({ sbom: {
+  name: "openai/example",
+  packages: [
+    { SPDXID: "SPDXRef-Repository", name: "example", versionInfo: "main", externalRefs: [{ referenceLocator: "pkg:github/openai/example@main" }] },
+    { SPDXID: "SPDXRef-a", name: "alpha", versionInfo: "1.0.0", externalRefs: [{ referenceLocator: "pkg:npm/alpha@1.0.0" }] },
+    { SPDXID: "SPDXRef-b", name: "beta", versionInfo: "2.0.0", externalRefs: [{ referenceLocator: "pkg:npm/beta@2.0.0" }] },
+    { SPDXID: "SPDXRef-no-version", name: "unversioned", externalRefs: [{ referenceLocator: "pkg:npm/unversioned" }] }
+  ]
+}}, 1);
+assert(githubSbomInventory.discoveredPackageCount === 3, "repository root package must be excluded from dependency count");
+assert(githubSbomInventory.packages.length === 1 && githubSbomInventory.truncated, "GitHub SBOM package queries must honor the configured cap");
+assert(githubSbomInventory.skippedWithoutVersion === 1, "unversioned packages must not generate broad OSV queries");
+
+const npmLockInventory = extractGitHubLockfilePackages("package-lock.json", JSON.stringify({
+  lockfileVersion: 3,
+  packages: {
+    "": { name: "root", version: "1.0.0" },
+    "node_modules/@scope/alpha": { version: "1.2.3" },
+    "node_modules/beta": { version: "2.0.0" },
+    "node_modules/unversioned": {}
+  }
+}), 10);
+assert(npmLockInventory.packages.some((pkg) => pkg.purl === "pkg:npm/%40scope/alpha@1.2.3"), "npm lockfile fallback should preserve scoped package identity");
+assert(npmLockInventory.packages.some((pkg) => pkg.purl === "pkg:npm/beta@2.0.0"), "npm lockfile fallback should extract exact versions");
+assert(npmLockInventory.skippedWithoutVersion === 1, "lockfile fallback should skip packages without exact versions");
+
+const requirementsInventory = extractGitHubLockfilePackages("requirements.txt", "Django==5.0.1\nrequests>=2.0\nflask==3.0.0; python_version > '3.9'\n", 10);
+assert(requirementsInventory.packages.length === 2, "requirements fallback should accept exact pins and reject ranges");
+assert(extractGitHubLockfilePackages("go.sum", "golang.org/x/text v0.3.0 h1:test\ngolang.org/x/text v0.3.0/go.mod h1:test\n", 10).packages.length === 1, "Go fallback should ignore go.mod checksum rows");
+assert(extractGitHubLockfilePackages("Cargo.lock", '[[package]]\nname = "serde"\nversion = "1.0.0"\n', 10).packages[0]?.purl === "pkg:cargo/serde@1.0.0", "Cargo fallback should extract package blocks");
+assert(extractGitHubLockfilePackages("Gemfile.lock", "GEM\n  specs:\n    rack (3.0.0)\n", 10).packages[0]?.purl === "pkg:gem/rack@3.0.0", "Gemfile fallback should extract locked gems");
+assert(extractGitHubLockfilePackages("composer.lock", JSON.stringify({ packages: [{ name: "vendor/package", version: "1.0.0" }] }), 10).packages[0]?.purl === "pkg:composer/vendor/package@1.0.0", "Composer fallback should extract locked packages");
+assert(extractGitHubLockfilePackages("package-lock.json", "{not json", 10).parseError, "malformed lockfiles must fail closed");
+
+const groupedFindings = buildRepositoryCveFindings({ packages: [{
+  purl: "pkg:npm/alpha@1.0.0",
+  name: "alpha|injected\nrow",
+  version: "1.0.0",
+  vulnerabilities: [{
+    id: "GHSA-test",
+    cves: ["CVE-2024-12345"],
+    aliases: ["CVE-2024-12345"],
+    severity: "HIGH",
+    fixedVersions: ["1.0.1"],
+    references: [{ url: "https://osv.dev/vulnerability/GHSA-test" }, { url: "javascript:alert(1)" }]
+  }]
+}] });
+assert(groupedFindings.length === 1 && groupedFindings[0].packages.length === 1, "repository findings should group duplicate aliases by CVE and package");
+const issueDraft = buildGitHubIssueDraft({
+  ...groupedFindings[0],
+  packages: groupedFindings[0].packages.map((pkg) => ({ ...pkg, purl: "" }))
+}, { fullName: "openai/example", url: "https://github.com/openai/example" }, "2026-08-11T00:00:00Z");
+assert(issueDraft.title.startsWith("[Security] CVE-2024-12345"), "issue draft title should identify the confirmed CVE");
+assert(!issueDraft.body.includes("javascript:"), "unsafe advisory references must not enter issue bodies");
+assert(issueDraft.body.includes("alpha\\|injected row"), "package text must not inject Markdown table rows");
+
+process.env.MOCK_GITHUB_SCAN = "1";
+const mockGitHubScan = await handleApiRequest({
+  path: "/api/github/scan",
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  trustedClientAddress: "github-scan-test",
+  body: JSON.stringify({ url: "https://github.com/openai/example" })
+});
+assert(mockGitHubScan.statusCode === 200, "valid public repository scans should return 200");
+assert(JSON.parse(mockGitHubScan.body).packages[0].vulnerabilities[0].cves[0] === "CVE-2024-0001", "repository scan should return package-specific CVE matches");
+delete process.env.MOCK_GITHUB_SCAN;
 
 const versionedPurlQuery = buildOsvQuery({
   purl: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",

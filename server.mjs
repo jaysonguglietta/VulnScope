@@ -28,6 +28,13 @@ const enrichmentOutboundMaxBytes = positiveInt(process.env.ENRICHMENT_OUTBOUND_M
 const enrichmentDeadlineMs = positiveInt(process.env.ENRICHMENT_DEADLINE_MS, 15 * 1000);
 const osvDetailCacheTtlMs = positiveInt(process.env.OSV_DETAIL_CACHE_TTL_MS, 60 * 60 * 1000);
 const osvDetailCacheMaxEntries = positiveInt(process.env.OSV_DETAIL_CACHE_MAX_ENTRIES, 500);
+const githubRepositoryPackageMax = positiveInt(process.env.GITHUB_REPOSITORY_PACKAGE_MAX, 50);
+const githubRepositorySbomInspectMax = positiveInt(process.env.GITHUB_REPOSITORY_SBOM_INSPECT_MAX, 20000);
+const githubRepositoryTreeInspectMax = positiveInt(process.env.GITHUB_REPOSITORY_TREE_INSPECT_MAX, 50000);
+const githubRepositoryLockfileMax = positiveInt(process.env.GITHUB_REPOSITORY_LOCKFILE_MAX, 10);
+const githubRepositoryLockfileMaxBytes = positiveInt(process.env.GITHUB_REPOSITORY_LOCKFILE_MAX_BYTES, 4 * 1024 * 1024);
+const githubRepositoryInventoryMaxBytes = positiveInt(process.env.GITHUB_REPOSITORY_INVENTORY_MAX_BYTES, 16 * 1024 * 1024);
+const githubRepositoryInventoryDeadlineMs = positiveInt(process.env.GITHUB_REPOSITORY_INVENTORY_DEADLINE_MS, 15 * 1000);
 const rateLimitBuckets = new Map();
 const researchQueue = [];
 const outboundQueue = [];
@@ -47,7 +54,7 @@ const mimeTypes = {
 };
 
 const securityHeaders = {
-  "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.github.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
   "cross-origin-opener-policy": "same-origin",
   "cross-origin-resource-policy": "same-origin",
   "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
@@ -97,6 +104,12 @@ const sourceCatalog = [
     label: "GitHub Advisory Database",
     kind: "official",
     url: "https://api.github.com/advisories"
+  },
+  {
+    id: "githubSbom",
+    label: "GitHub Repository Inventory",
+    kind: "repository-intelligence",
+    url: "https://api.github.com/repos/OWNER/REPO/dependency-graph/sbom"
   },
   {
     id: "hackerNews",
@@ -581,6 +594,32 @@ export async function handleApiRequest({
     }
     const payload = await withResearchSlot(() => enrichPackages(packages));
     return jsonApiResponse(payload);
+  }
+
+  if (path === "/api/github/scan") {
+    if (normalizedMethod !== "POST") return methodNotAllowed(["POST"]);
+    if (Buffer.byteLength(String(body || ""), "utf8") > apiBodyMaxBytes) {
+      return jsonApiResponse({ error: true, message: "Repository scan request is too large." }, 413);
+    }
+    const request = parseJsonBody(body);
+    if (!request.ok) return jsonApiResponse({ error: true, message: request.message }, 400);
+    const repository = normalizeGitHubRepositoryUrl(request.value?.url);
+    if (!repository) {
+      return jsonApiResponse({ error: true, message: "Enter a public GitHub repository URL in the form https://github.com/owner/repository." }, 400);
+    }
+    const rateLimit = checkResearchRateLimit({ headers, socket: { remoteAddress }, trustedClientAddress }, false);
+    if (!rateLimit.allowed) {
+      return jsonApiResponse({ error: true, message: rateLimit.message }, 429, { "retry-after": String(rateLimit.retryAfterSeconds) });
+    }
+    if (!canAcceptResearch()) {
+      return jsonApiResponse({ error: true, message: "The research queue is busy. Try again shortly." }, 503, { "retry-after": "10" });
+    }
+    try {
+      const payload = await withResearchSlot(() => scanGitHubRepository(repository));
+      return jsonApiResponse(payload);
+    } catch (error) {
+      return jsonApiResponse({ error: true, message: githubRepositoryScanError(error) }, 502);
+    }
   }
 
   if (path.startsWith("/api/")) {
@@ -1249,6 +1288,464 @@ function unwrapVulnCheckResult(result) {
     return result.value.data;
   }
   return result.value;
+}
+
+export function normalizeGitHubRepositoryUrl(value) {
+  const input = boundedString(value, 500);
+  if (!input) return null;
+  let parsed;
+  try {
+    parsed = new URL(input);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname.toLowerCase() !== "github.com" ||
+    parsed.port ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    return null;
+  }
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments.length !== 2 || segments.some((segment) => segment.includes("%"))) return null;
+  const owner = segments[0];
+  const name = segments[1].replace(/\.git$/i, "");
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,38})$/i.test(owner)) return null;
+  if (!/^[a-z0-9._-]{1,100}$/i.test(name) || name === "." || name === "..") return null;
+  return {
+    owner,
+    name,
+    fullName: `${owner}/${name}`,
+    url: `https://github.com/${owner}/${name}`
+  };
+}
+
+export function extractGitHubSbomPackages(payload, limit = githubRepositoryPackageMax) {
+  const sbom = payload?.sbom;
+  const entries = Array.isArray(sbom?.packages) ? sbom.packages.slice(0, githubRepositorySbomInspectMax) : [];
+  const seen = new Set();
+  const queryable = [];
+  let discoveredPackageCount = 0;
+  let skippedWithoutVersion = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const refs = Array.isArray(entry.externalRefs) ? entry.externalRefs.slice(0, 100) : [];
+    const purl = boundedString(refs.find((ref) => /^pkg:/i.test(String(ref?.referenceLocator || "")))?.referenceLocator, 1000);
+    if (!/^pkg:[a-z0-9.+-]+\/[a-z0-9._~!$&'()*+,;=:@%/-]+/i.test(purl)) continue;
+    const purlType = purl.match(/^pkg:([^/]+)\//i)?.[1]?.toLowerCase() || "";
+    if (purlType === "github" || entry.SPDXID === "SPDXRef-Repository") continue;
+    discoveredPackageCount += 1;
+    const version = boundedString(entry.versionInfo || entry.packageVersion, 200);
+    const purlHasVersion = /@[^/?#]+(?:[?#]|$)/.test(purl);
+    if (!purlHasVersion && !version) {
+      skippedWithoutVersion += 1;
+      continue;
+    }
+    const key = purl.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    queryable.push({
+      key: purl,
+      purl,
+      ecosystem: osvEcosystemFromPurlType(purlType),
+      name: boundedString(entry.name || entry.packageName, 300),
+      version,
+      fileName: boundedString(sbom.name || "GitHub dependency graph", 300)
+    });
+  }
+  const safeLimit = Math.max(1, Math.min(Number(limit) || githubRepositoryPackageMax, 500));
+  return {
+    packages: queryable.slice(0, safeLimit),
+    discoveredPackageCount,
+    queryablePackageCount: queryable.length,
+    skippedWithoutVersion,
+    truncated: queryable.length > safeLimit || (Array.isArray(sbom?.packages) && sbom.packages.length > entries.length)
+  };
+}
+
+function osvEcosystemFromPurlType(type) {
+  return {
+    cargo: "crates.io",
+    composer: "Packagist",
+    gem: "RubyGems",
+    golang: "Go",
+    hex: "Hex",
+    maven: "Maven",
+    npm: "npm",
+    nuget: "NuGet",
+    pub: "Pub",
+    pypi: "PyPI"
+  }[type] || "";
+}
+
+async function scanGitHubRepository(repository) {
+  if (process.env.MOCK_GITHUB_SCAN === "1") return buildMockGitHubRepositoryScan(repository);
+  const started = Date.now();
+  let githubData;
+  try {
+    githubData = await fetchGitHubRepositorySbom(repository);
+  } catch (error) {
+    const result = {
+      id: "githubSbom",
+      label: "GitHub Dependency Graph",
+      status: "error",
+      message: githubRepositoryScanError(error),
+      latencyMs: Date.now() - started,
+      url: repository.url
+    };
+    recordSourceTelemetry(result);
+    throw new Error(result.message);
+  }
+  const githubSource = {
+    id: "githubSbom",
+    label: githubData.inventorySource.label,
+    status: "ok",
+    message: githubData.inventorySource.message,
+    latencyMs: Date.now() - started,
+    url: githubData.inventorySource.url
+  };
+  recordSourceTelemetry(githubSource);
+
+  if (!githubData.inventory.packages.length) {
+    return {
+      generatedAt: new Date().toISOString(),
+      repository: githubData.repository,
+      inventory: { ...githubData.inventory, packages: undefined, scannedPackageCount: 0 },
+      packageCount: 0,
+      vulnerabilityCount: 0,
+      truncated: githubData.inventory.truncated,
+      packages: [],
+      sourceResults: [githubSource, {
+        id: "osv",
+        label: "OSV Package Intelligence",
+        status: "skipped",
+        message: "No versioned packages were available for OSV matching.",
+        latencyMs: 0,
+        url: "https://api.osv.dev/v1/querybatch"
+      }]
+    };
+  }
+
+  const enrichment = await enrichPackages(githubData.inventory.packages);
+  return {
+    ...enrichment,
+    repository: githubData.repository,
+    inventory: {
+      discoveredPackageCount: githubData.inventory.discoveredPackageCount,
+      queryablePackageCount: githubData.inventory.queryablePackageCount,
+      scannedPackageCount: enrichment.packageCount,
+      skippedWithoutVersion: githubData.inventory.skippedWithoutVersion,
+      inspectedFileCount: githubData.inventory.inspectedFileCount,
+      parseErrorCount: githubData.inventory.parseErrorCount,
+      truncated: githubData.inventory.truncated
+    },
+    truncated: githubData.inventory.truncated || enrichment.truncated,
+    sourceResults: [githubSource, ...enrichment.sourceResults]
+  };
+}
+
+async function fetchGitHubRepositorySbom(repository) {
+  const headers = {
+    accept: "application/vnd.github+json",
+    "user-agent": "VulnScope/0.3",
+    "x-github-api-version": "2026-03-10"
+  };
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const owner = encodeURIComponent(repository.owner);
+  const name = encodeURIComponent(repository.name);
+  const metadata = await fetchJson(`https://api.github.com/repos/${owner}/${name}`, { headers });
+  if (metadata?.private) throw new Error("Private repositories are not supported by public repository scan.");
+  const repositoryDetails = {
+    owner: boundedString(metadata?.owner?.login || repository.owner, 100),
+    name: boundedString(metadata?.name || repository.name, 100),
+    fullName: boundedString(metadata?.full_name || repository.fullName, 220),
+    url: safeHttpUrl(metadata?.html_url) || repository.url,
+    description: boundedString(metadata?.description, 1000),
+    defaultBranch: boundedString(metadata?.default_branch, 200),
+    archived: Boolean(metadata?.archived),
+    fork: Boolean(metadata?.fork),
+    issuesEnabled: metadata?.has_issues !== false,
+    stars: Number(metadata?.stargazers_count) || 0,
+    pushedAt: metadata?.pushed_at || null,
+    sbomGeneratedAt: null
+  };
+
+  try {
+    const payload = await fetchJson(`https://api.github.com/repos/${owner}/${name}/dependency-graph/sbom`, { headers });
+    const inventory = extractGitHubSbomPackages(payload);
+    repositoryDetails.sbomGeneratedAt = payload?.sbom?.creationInfo?.created || null;
+    return {
+      repository: repositoryDetails,
+      inventory,
+      inventorySource: {
+        label: "GitHub Dependency Graph",
+        message: `Loaded ${inventory.discoveredPackageCount} dependency package record${inventory.discoveredPackageCount === 1 ? "" : "s"} from GitHub's generated SBOM.`,
+        url: `${repository.url}/network/dependencies`
+      }
+    };
+  } catch (error) {
+    if (!String(error?.message || "").includes("404")) throw error;
+  }
+
+  const inventory = await fetchGitHubLockfileInventory(repositoryDetails, headers);
+  return {
+    repository: repositoryDetails,
+    inventory,
+      inventorySource: {
+        label: "GitHub Lockfile Inventory",
+        message: `GitHub's generated SBOM was unavailable; loaded ${inventory.discoveredPackageCount} exact package version${inventory.discoveredPackageCount === 1 ? "" : "s"} from ${inventory.inspectedFileCount} supported lockfile${inventory.inspectedFileCount === 1 ? "" : "s"}.${inventory.parseErrorCount ? ` ${inventory.parseErrorCount} lockfile${inventory.parseErrorCount === 1 ? "" : "s"} could not be parsed.` : ""}`,
+        url: `${repository.url}/tree/${encodeURIComponent(repositoryDetails.defaultBranch || "HEAD")}`
+      }
+  };
+}
+
+async function fetchGitHubLockfileInventory(repository, headers) {
+  const owner = encodeURIComponent(repository.owner);
+  const name = encodeURIComponent(repository.name);
+  const branch = encodeURIComponent(repository.defaultBranch || "HEAD");
+  const budget = createOutboundBudget({
+    maxCalls: githubRepositoryLockfileMax + 1,
+    maxBytes: githubRepositoryInventoryMaxBytes,
+    deadlineMs: githubRepositoryInventoryDeadlineMs
+  });
+  const tree = await fetchJson(`https://api.github.com/repos/${owner}/${name}/git/trees/${branch}?recursive=1`, { headers }, budget);
+  const treeEntries = Array.isArray(tree?.tree) ? tree.tree : [];
+  const entries = treeEntries.slice(0, githubRepositoryTreeInspectMax);
+  const supportedEntries = entries.filter((entry) => entry?.type === "blob" && supportedGitHubLockfile(entry.path));
+  const candidates = supportedEntries.slice(0, githubRepositoryLockfileMax);
+  const seen = new Set();
+  const packages = [];
+  let discoveredPackageCount = 0;
+  let skippedWithoutVersion = 0;
+  let parseErrorCount = 0;
+
+  for (const entry of candidates) {
+    const sha = /^[a-f0-9]{40}$/i.test(String(entry.sha || "")) ? entry.sha : "";
+    if (!sha) continue;
+    const blob = await fetchJson(`https://api.github.com/repos/${owner}/${name}/git/blobs/${sha}`, { headers }, budget);
+    const content = decodeGitHubBlob(blob);
+    const extracted = extractGitHubLockfilePackages(entry.path, content, githubRepositoryPackageMax * 4);
+    if (extracted.parseError) {
+      parseErrorCount += 1;
+      continue;
+    }
+    discoveredPackageCount += extracted.discoveredPackageCount;
+    skippedWithoutVersion += extracted.skippedWithoutVersion;
+    for (const pkg of extracted.packages) {
+      const key = pkg.purl.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      packages.push(pkg);
+    }
+  }
+
+  return {
+    packages: packages.slice(0, githubRepositoryPackageMax),
+    discoveredPackageCount,
+    queryablePackageCount: packages.length,
+    skippedWithoutVersion,
+    inspectedFileCount: candidates.length,
+    parseErrorCount,
+    truncated: Boolean(tree?.truncated) || treeEntries.length > githubRepositoryTreeInspectMax || supportedEntries.length > githubRepositoryLockfileMax || packages.length > githubRepositoryPackageMax || parseErrorCount > 0
+  };
+}
+
+function supportedGitHubLockfile(path) {
+  const file = String(path || "").split("/").pop()?.toLowerCase();
+  return ["package-lock.json", "npm-shrinkwrap.json", "pipfile.lock", "requirements.txt", "composer.lock", "go.sum", "cargo.lock", "gemfile.lock"].includes(file);
+}
+
+function decodeGitHubBlob(blob) {
+  if (blob?.encoding !== "base64") throw new Error("GitHub returned an unsupported lockfile encoding.");
+  const encoded = String(blob?.content || "").replace(/\s/g, "");
+  if (!encoded || !/^[a-z0-9+/]*={0,2}$/i.test(encoded)) throw new Error("GitHub returned an invalid lockfile payload.");
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.length > githubRepositoryLockfileMaxBytes) throw new Error("A repository lockfile exceeded the scan size limit.");
+  return decoded.toString("utf8");
+}
+
+export function extractGitHubLockfilePackages(path, content, limit = githubRepositoryPackageMax) {
+  const file = String(path || "").split("/").pop()?.toLowerCase();
+  const safeLimit = Math.max(1, Math.min(Number(limit) || githubRepositoryPackageMax, 1000));
+  const records = [];
+  let skippedWithoutVersion = 0;
+  const add = (type, ecosystem, nameValue, versionValue) => {
+    const rawName = boundedString(nameValue, 300).trim();
+    const name = type === "pypi" ? rawName.toLowerCase().replace(/[-_.]+/g, "-") : rawName;
+    const version = boundedString(versionValue, 200).trim().replace(/^==/, "");
+    if (!name || !version) {
+      skippedWithoutVersion += 1;
+      return;
+    }
+    const purlName = name.split("/").map((part) => encodeURIComponent(part)).join("/");
+    records.push({
+      key: `pkg:${type}/${purlName}@${encodeURIComponent(version)}`,
+      purl: `pkg:${type}/${purlName}@${encodeURIComponent(version)}`,
+      ecosystem,
+      name,
+      version,
+      fileName: boundedString(path, 300)
+    });
+  };
+
+  try {
+    if (file === "package-lock.json" || file === "npm-shrinkwrap.json") {
+      const lock = JSON.parse(content);
+      if (lock?.packages && typeof lock.packages === "object") {
+        for (const [packagePath, entry] of Object.entries(lock.packages).slice(0, githubRepositorySbomInspectMax)) {
+          if (!packagePath || !entry || typeof entry !== "object") continue;
+          const marker = "node_modules/";
+          const markerIndex = packagePath.lastIndexOf(marker);
+          const packageName = entry.name || (markerIndex >= 0 ? packagePath.slice(markerIndex + marker.length) : "");
+          add("npm", "npm", packageName, entry.version);
+        }
+      } else {
+        const walk = (dependencies, depth = 0) => {
+          if (!dependencies || typeof dependencies !== "object" || depth > 20 || records.length >= githubRepositorySbomInspectMax) return;
+          for (const [packageName, entry] of Object.entries(dependencies)) {
+            if (!entry || typeof entry !== "object") continue;
+            add("npm", "npm", packageName, entry.version);
+            walk(entry.dependencies, depth + 1);
+          }
+        };
+        walk(lock?.dependencies);
+      }
+    } else if (file === "pipfile.lock") {
+      const lock = JSON.parse(content);
+      for (const section of [lock?.default, lock?.develop]) {
+        for (const [packageName, entry] of Object.entries(section || {})) add("pypi", "PyPI", packageName, entry?.version);
+      }
+    } else if (file === "composer.lock") {
+      const lock = JSON.parse(content);
+      for (const entry of [...(lock?.packages || []), ...(lock?.["packages-dev"] || [])]) add("composer", "Packagist", entry?.name, entry?.version);
+    } else if (file === "requirements.txt") {
+      for (const line of content.split(/\r?\n/).slice(0, githubRepositorySbomInspectMax)) {
+        const match = line.trim().match(/^([a-z0-9][a-z0-9._-]*(?:\[[^\]]+\])?)==([^\s;#]+)(?:\s*[;#]|$)/i);
+        if (match) add("pypi", "PyPI", match[1].replace(/\[.*$/, ""), match[2]);
+      }
+    } else if (file === "go.sum") {
+      for (const line of content.split(/\r?\n/).slice(0, githubRepositorySbomInspectMax)) {
+        const [moduleName, version] = line.trim().split(/\s+/);
+        if (moduleName && version && !version.endsWith("/go.mod")) add("golang", "Go", moduleName, version.replace(/\/go\.mod$/, ""));
+      }
+    } else if (file === "cargo.lock") {
+      for (const block of content.split(/^\s*\[\[package\]\]\s*$/m).slice(1, githubRepositorySbomInspectMax + 1)) {
+        add("cargo", "crates.io", block.match(/^name\s*=\s*"([^"]+)"/m)?.[1], block.match(/^version\s*=\s*"([^"]+)"/m)?.[1]);
+      }
+    } else if (file === "gemfile.lock") {
+      for (const line of content.split(/\r?\n/).slice(0, githubRepositorySbomInspectMax)) {
+        const match = line.match(/^\s{4}([^\s(]+) \(([^)\s]+)(?:-[^)]+)?\)$/);
+        if (match) add("gem", "RubyGems", match[1], match[2]);
+      }
+    }
+  } catch {
+    return { packages: [], discoveredPackageCount: 0, skippedWithoutVersion: 0, parseError: true };
+  }
+
+  const seen = new Set();
+  const packages = records.filter((pkg) => {
+    const key = pkg.purl.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return {
+    packages: packages.slice(0, safeLimit),
+    discoveredPackageCount: packages.length,
+    skippedWithoutVersion,
+    parseError: false,
+    truncated: packages.length > safeLimit
+  };
+}
+
+function buildMockGitHubRepositoryScan(repository) {
+  const generatedAt = new Date().toISOString();
+  return {
+    generatedAt,
+    repository: {
+      ...repository,
+      description: "Mock public repository used for browser and security tests.",
+      defaultBranch: "main",
+      archived: false,
+      fork: false,
+      issuesEnabled: true,
+      stars: 42,
+      pushedAt: generatedAt,
+      sbomGeneratedAt: generatedAt
+    },
+    inventory: {
+      discoveredPackageCount: 2,
+      queryablePackageCount: 2,
+      scannedPackageCount: 2,
+      skippedWithoutVersion: 0,
+      truncated: false
+    },
+    packageCount: 2,
+    vulnerabilityCount: 1,
+    truncated: false,
+    packages: [{
+      key: "pkg:npm/example-package@1.0.0",
+      purl: "pkg:npm/example-package@1.0.0",
+      ecosystem: "npm",
+      name: "example-package",
+      version: "1.0.0",
+      fileName: `${repository.fullName} dependency graph`,
+      vulnerabilities: [{
+        id: "GHSA-mock-0000-0000",
+        aliases: ["CVE-2024-0001"],
+        cves: ["CVE-2024-0001"],
+        summary: "Mock dependency vulnerability for interface validation.",
+        details: "Mock scan data is enabled.",
+        severity: "HIGH",
+        published: generatedAt,
+        modified: generatedAt,
+        withdrawn: null,
+        fixedVersions: ["1.0.1"],
+        fixProvenance: [],
+        affected: [],
+        references: [{ type: "ADVISORY", url: "https://osv.dev/vulnerability/GHSA-mock-0000-0000" }]
+      }]
+    }, {
+      key: "pkg:npm/safe-package@2.0.0",
+      purl: "pkg:npm/safe-package@2.0.0",
+      ecosystem: "npm",
+      name: "safe-package",
+      version: "2.0.0",
+      fileName: `${repository.fullName} dependency graph`,
+      vulnerabilities: []
+    }],
+    sourceResults: [{
+      id: "githubSbom",
+      label: "GitHub Dependency Graph",
+      status: "ok",
+      message: "Loaded mock dependency graph.",
+      latencyMs: 0,
+      url: `${repository.url}/network/dependencies`
+    }, {
+      id: "osv",
+      label: "OSV Package Intelligence",
+      status: "ok",
+      message: "Loaded mock OSV matches.",
+      latencyMs: 0,
+      url: "https://api.osv.dev/v1/querybatch"
+    }]
+  };
+}
+
+function githubRepositoryScanError(error) {
+  const message = String(error?.message || "");
+  if (message.includes("Private repositories are not supported")) return "Only public GitHub repositories can be scanned.";
+  if (message.includes("404")) return "The public repository or its default branch inventory was not found.";
+  if (message.includes("403")) return "GitHub refused the repository inventory request. The public API rate limit may be exhausted.";
+  if (message.includes("429")) return "GitHub rate-limited the repository scan. Try again later.";
+  if (message === "Request timed out.") return "GitHub did not return the repository inventory before the scan timed out.";
+  if (message.includes("lockfile exceeded")) return "A supported repository lockfile exceeded the scan size limit.";
+  if (message.startsWith("GitHub ") || message.startsWith("Only public ") || message.startsWith("The public ")) return message;
+  return "The public GitHub repository scan failed.";
 }
 
 function normalizeEnrichmentPackages(value) {

@@ -8,13 +8,14 @@ The `main` branch is the active development version.
 
 VulnScope has no authentication, authorization, tenant isolation, or request logging by design. The public AWS deployment is suitable for public CVE research with non-sensitive browser-local data. It is not suitable for confidential shared case management, regulated evidence, or untrusted multi-user administration.
 
-Do not place private source tokens in the browser bundle, commit them to Git, or enter confidential notes into a shared browser profile. Add identity and per-user authorization before introducing server-side case, watchlist, SBOM, or inventory storage.
+Do not place private research-source tokens in the browser bundle, commit them to Git, or enter confidential notes into a shared browser profile. The optional GitHub issue token is an analyst-supplied, repository-scoped credential held only in browser memory and sent directly to GitHub. Add identity and per-user authorization before introducing server-side case, watchlist, SBOM, or inventory storage.
 
 ## Implemented Controls
 
-- Source credentials remain server-side in environment variables.
+- Research-source credentials remain server-side in environment variables; GitHub issue tokens never pass through the VulnScope server.
 - API methods and paths are allowlisted; JSON bodies and package counts are bounded.
 - Research and enrichment have per-client rate limits, queue bounds, outbound concurrency limits, response-size limits, and Lambda/API Gateway capacity limits.
+- Public repository scanning accepts only canonical GitHub HTTPS URLs, constructs fixed `api.github.com` destinations, rejects private repositories, and caps tree entries, lockfiles, decoded bytes, upstream calls, dependency queries, and vulnerability processing.
 - API Gateway supplies the trusted client address in Lambda. Public `X-Forwarded-For` values do not select the rate-limit key.
 - Static responses and API responses use CSP, frame blocking, content-type protection, referrer and permissions policies, and production HSTS.
 - Rendered source text is escaped and external links are restricted to HTTP(S).

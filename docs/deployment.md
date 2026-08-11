@@ -133,10 +133,13 @@ Production exposes only:
 - `GET /api/health`
 - `GET /api/research?cve=CVE-YYYY-NNNN[&refresh=1]`
 - `POST /api/enrich`
+- `POST /api/github/scan`
 
-CloudFront requires its full seven-method origin behavior whenever `POST` is enabled. The effective application allowlist is the three explicit API Gateway routes above; `PUT`, `PATCH`, `DELETE`, and unknown paths have no API Gateway route and do not invoke the Lambda.
+CloudFront requires its full seven-method origin behavior whenever `POST` is enabled. The effective application allowlist is the four explicit API Gateway routes above; `PUT`, `PATCH`, `DELETE`, and unknown paths have no API Gateway route and do not invoke the Lambda.
 
-The enrichment request is JSON and accepts no more than 50 package records. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 40 per request, individual upstream responses are capped at 8 MiB, and the request has a 32 MiB aggregate response budget, 41-call budget, and 15-second outbound deadline. Warm Lambda environments cache up to 500 OSV detail records for one hour.
+The enrichment request is JSON and accepts no more than 50 package records. Public GitHub scans accept only canonical HTTPS repository URLs, reject private repositories, inspect at most 20,000 SBOM package rows, and query at most 50 unique versioned dependencies. If GitHub's generated SBOM is unavailable, the scanner inspects up to 50,000 tree entries and 10 supported lockfiles through fixed `api.github.com` endpoints, with a 4 MiB decoded limit per file, 16 MiB aggregate response budget, and 15-second inventory deadline. Supported fallback inputs are `package-lock.json`, `npm-shrinkwrap.json`, `requirements.txt`, `Pipfile.lock`, `composer.lock`, `go.sum`, `Cargo.lock`, and `Gemfile.lock`; only exact versions are queried. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 40 per request, individual upstream responses are capped at 8 MiB, and OSV enrichment has a 32 MiB aggregate response budget, 41-call budget, and 15-second outbound deadline. Warm Lambda environments cache up to 500 OSV detail records for one hour.
+
+Automatic issue publishing does not use the Lambda API. The browser sends the analyst-provided, fine-grained `Issues: write` token directly to `https://api.github.com`, checks for an existing CVE title, creates confirmed issues sequentially, and does not persist the token. The production CSP permits that single additional connection origin.
 
 The CloudFront WAF blocks an IP after 100 requests in a five-minute evaluation window for `/api/` paths. API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
 
@@ -149,6 +152,7 @@ Lambda uses API Gateway's `requestContext.http.sourceIp` as its trusted rate-lim
 - Static bucket: private OAC access, AES-256 encryption, versioning, noncurrent versions deleted after 7 days.
 - Artifact bucket: retained CloudFormation resource with public access blocked, AES-256 encryption, ownership enforcement, versioning, incomplete-upload cleanup after 1 day, noncurrent-version cleanup after 7 days, and artifact expiration after 30 days by default.
 - Browser uploads: memory only; cleared on refresh or by the user.
+- GitHub repository scan results and issue tokens: browser memory only; issue tokens are discarded after the publishing action.
 - Browser cases and watchlist: local storage; pruned after 90 days.
 - Monitor snapshots: encrypted DynamoDB; TTL after 180 days.
 - Lambda log groups: explicitly managed with 30-day retention and function-scoped write permissions.
