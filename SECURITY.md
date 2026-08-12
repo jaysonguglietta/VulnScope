@@ -10,12 +10,20 @@ VulnScope has no authentication, authorization, tenant isolation, or request log
 
 Do not place private research-source tokens in the browser bundle, commit them to Git, or enter confidential notes into a shared browser profile. The optional GitHub issue token is an analyst-supplied, repository-scoped credential held only in browser memory and sent directly to GitHub. Add identity and per-user authorization before introducing server-side case, watchlist, SBOM, or inventory storage.
 
+Repository scanning processes public repository metadata, GitHub's generated
+SBOM, or recognized public lockfiles on the server and sends exact package
+identities and versions to OSV. Do not use the feature when that disclosure is
+prohibited by policy. The server-side `GITHUB_TOKEN` used for public API rate
+limits is distinct from the browser-only issue token.
+
 ## Implemented Controls
 
 - Research-source credentials remain server-side in environment variables; GitHub issue tokens never pass through the VulnScope server.
 - API methods and paths are allowlisted; JSON bodies and package counts are bounded.
 - Research and enrichment have per-client rate limits, queue bounds, outbound concurrency limits, response-size limits, and Lambda/API Gateway capacity limits.
-- Public repository scanning accepts only canonical GitHub HTTPS URLs, constructs fixed `api.github.com` destinations, rejects private repositories, and caps tree entries, lockfiles, decoded bytes, upstream calls, dependency queries, and vulnerability processing.
+- Public repository scanning accepts only canonical GitHub HTTPS URLs, constructs fixed `api.github.com` destinations, rejects private repositories, and caps tree entries, lockfiles, decoded bytes, upstream calls, dependency queries, vulnerability processing, and issue batches.
+- Repository metadata, package identities, advisory text, links, and generated issue Markdown are treated as untrusted input; rendered content is escaped, links are restricted to HTTP(S), and issue fields are bounded and sanitized.
+- Automatic issue filing requires analyst selection, issue-draft review, an explicit confirmation checkbox, and a final browser confirmation. Existing open or closed CVE-title matches are skipped.
 - API Gateway supplies the trusted client address in Lambda. Public `X-Forwarded-For` values do not select the rate-limit key.
 - Static responses and API responses use CSP, frame blocking, content-type protection, referrer and permissions policies, and production HSTS.
 - Rendered source text is escaped and external links are restricted to HTTP(S).
@@ -33,8 +41,12 @@ Do not place private research-source tokens in the browser bundle, commit them t
 - Request and analyst activity logging
 - Server-side case, SBOM, cloud inventory, or watchlist storage
 - Multi-tenant isolation
+- Private-repository scanning and GitHub App installation authentication
 
 These omissions are deployment constraints, not controls. Put VulnScope behind an identity-aware proxy or private network boundary if it must handle sensitive work before native identity is implemented.
+
+See [Public GitHub Repository Scanning](docs/github-repository-scanning.md) for
+the detailed token, data-flow, limit, and recovery model.
 
 ## Reporting Issues
 

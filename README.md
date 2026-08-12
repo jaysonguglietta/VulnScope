@@ -34,8 +34,18 @@ Production: [https://vulnscope.jsontechnology.com](https://vulnscope.jsontechnol
 - Falls back to bounded, read-only lockfile inspection when Dependency Graph is disabled. Exact pins are supported from npm, pip/Pipenv, Composer, Go, Cargo, and Bundler lock formats.
 - Queries versioned package identifiers against OSV and groups package-specific matches by CVE for analyst confirmation.
 - Generates one remediation issue per confirmed CVE, including detected versions, known fixes, OSV records, references, and validation steps.
-- Checks for an existing CVE issue before publishing. A fine-grained token with repository-scoped `Issues: write` permission is held only in browser memory and sent directly to `api.github.com`.
+- Checks for an existing CVE issue before publishing. A fine-grained token with repository-scoped **Issues: Read and write** permission is held only in browser memory and sent directly to `api.github.com`.
 - Provides prefilled GitHub issue drafts when automatic publishing is not desired.
+
+Typical workflow: open **Scan GitHub repository**, paste the public repository
+URL, run the scan, review package-specific CVE matches, select up to 10 findings,
+and review the generated issues. Automatic publishing requires a fine-grained
+token restricted to the destination repository with **Issues: Read and write**;
+manual prefilled issue drafts do not require a token in VulnScope.
+
+See [Public GitHub Repository Scanning](docs/github-repository-scanning.md) for
+the complete workflow, supported lockfiles, limits, token boundary, API contract,
+failure recovery, and interpretation guidance.
 
 ### Exposure workspace
 
@@ -86,7 +96,10 @@ Optional source tokens improve coverage or rate limits:
 NVD_API_KEY=... GITHUB_TOKEN=... VULNCHECK_API_TOKEN=... npm start
 ```
 
-Use `.env.example` as a reference and do not commit real secrets.
+The server-side `GITHUB_TOKEN` is optional read access for public GitHub research
+and API rate limits. It is separate from the ephemeral issue-writing token
+entered in the browser. Use `.env.example` as a reference and do not commit real
+secrets.
 
 ## Verify
 
@@ -131,4 +144,4 @@ See [docs/deployment.md](docs/deployment.md) for the resource inventory, route a
 
 ## Limitations
 
-VulnScope is a research and prioritization console, not an authenticated scanner or proof of exploitability. Repository scanning evaluates dependencies represented in GitHub's generated SBOM or supported lockfiles; it does not perform SAST, secret scanning, reachability analysis, or dynamic testing. Search matches, public chatter, inferred cloud services, imported findings, and package-version ranges can be incomplete or wrong. Confirm decisions against vendor advisories, authoritative inventory, scanner evidence, compensating controls, and production telemetry.
+VulnScope is a research and prioritization console, not an authenticated scanner or proof of exploitability. Repository scanning supports public repositories only and evaluates dependencies represented in GitHub's generated SBOM or a bounded set of exact-version lockfiles; it does not perform SAST, secret scanning, reachability analysis, or dynamic testing. Unsupported lockfiles, unpinned manifests, scan limits, and upstream outages can produce incomplete coverage. Search matches, public chatter, inferred cloud services, imported findings, and package-version ranges can be incomplete or wrong. Confirm decisions against vendor advisories, authoritative inventory, scanner evidence, compensating controls, and production telemetry.

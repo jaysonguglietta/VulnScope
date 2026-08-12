@@ -22,7 +22,7 @@ Optional EventBridge schedule
      -> SNS email for material changes
 ```
 
-Raw SBOM, cloud, and VEX files remain in browser memory. The backend receives a CVE ID for research or, after explicit confirmation, a bounded set of normalized package identifiers for OSV enrichment.
+Raw SBOM, cloud, and VEX files remain in browser memory. The backend receives a CVE ID for research or, after explicit confirmation, a bounded set of normalized package identifiers for OSV enrichment. Public repository scanning sends a validated GitHub owner/repository name to the backend, which reads GitHub's public generated SBOM or supported public lockfiles and sends exact package versions to OSV. GitHub issue publishing bypasses the backend: the browser sends an analyst-provided token directly to `api.github.com`.
 
 ## Resource Inventory
 
@@ -139,7 +139,36 @@ CloudFront requires its full seven-method origin behavior whenever `POST` is ena
 
 The enrichment request is JSON and accepts no more than 50 package records. Public GitHub scans accept only canonical HTTPS repository URLs, reject private repositories, inspect at most 20,000 SBOM package rows, and query at most 50 unique versioned dependencies. If GitHub's generated SBOM is unavailable, the scanner inspects up to 50,000 tree entries and 10 supported lockfiles through fixed `api.github.com` endpoints, with a 4 MiB decoded limit per file, 16 MiB aggregate response budget, and 15-second inventory deadline. Supported fallback inputs are `package-lock.json`, `npm-shrinkwrap.json`, `requirements.txt`, `Pipfile.lock`, `composer.lock`, `go.sum`, `Cargo.lock`, and `Gemfile.lock`; only exact versions are queried. API bodies are capped at 256 KiB, hydrated OSV vulnerability details are capped at 40 per request, individual upstream responses are capped at 8 MiB, and OSV enrichment has a 32 MiB aggregate response budget, 41-call budget, and 15-second outbound deadline. Warm Lambda environments cache up to 500 OSV detail records for one hour.
 
-Automatic issue publishing does not use the Lambda API. The browser sends the analyst-provided, fine-grained `Issues: write` token directly to `https://api.github.com`, checks for an existing CVE title, creates confirmed issues sequentially, and does not persist the token. The production CSP permits that single additional connection origin.
+Example repository scan:
+
+```bash
+curl -sS -X POST https://vulnscope.jsontechnology.com/api/github/scan \
+  -H 'content-type: application/json' \
+  --data '{"url":"https://github.com/jaysonguglietta/VulnScope"}'
+```
+
+The response includes normalized repository metadata, inventory counts,
+package-specific OSV results, `truncated` coverage state, and source results.
+The UI groups returned aliases by CVE. A successful response with no matches is
+not proof of safety when `truncated` is true or source results are degraded.
+
+Automatic issue publishing does not use the Lambda API. The browser sends the analyst-provided, fine-grained token directly to `https://api.github.com`, checks for an existing open or closed CVE title, creates confirmed issues sequentially, and does not persist the token. Limit the token to the destination repository with **Issues: Read and write** and a short expiration. The UI caps each publishing batch at 10 confirmed CVEs. The production CSP permits that single additional connection origin.
+
+Repository scan limits are configurable for local and alternative deployments:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `GITHUB_REPOSITORY_PACKAGE_MAX` | `50` | Unique exact versions sent to OSV |
+| `GITHUB_REPOSITORY_SBOM_INSPECT_MAX` | `20000` | Generated-SBOM or lockfile records inspected |
+| `GITHUB_REPOSITORY_TREE_INSPECT_MAX` | `50000` | Default-branch tree entries inspected |
+| `GITHUB_REPOSITORY_LOCKFILE_MAX` | `10` | Supported lockfiles fetched |
+| `GITHUB_REPOSITORY_LOCKFILE_MAX_BYTES` | `4194304` | Maximum decoded bytes per lockfile |
+| `GITHUB_REPOSITORY_INVENTORY_MAX_BYTES` | `16777216` | Aggregate GitHub inventory response budget |
+| `GITHUB_REPOSITORY_INVENTORY_DEADLINE_MS` | `15000` | GitHub inventory deadline |
+
+Increasing these values raises Lambda duration, OSV fan-out, GitHub API use, and
+abuse-cost exposure. Keep the OSV and outbound budgets aligned when changing the
+package maximum.
 
 The CloudFront WAF blocks an IP after 100 requests in a five-minute evaluation window for `/api/` paths. API Gateway throttles the stage to 2 requests per second with a burst of 5. The API Lambda has reserved concurrency 2; the optional monitor has reserved concurrency 1. Application-level queues and rate limits provide an additional bound.
 
@@ -163,6 +192,9 @@ Lambda uses API Gateway's `requestContext.http.sourceIp` as its trusted rate-lim
 curl -I https://vulnscope.jsontechnology.com/
 curl -sS https://vulnscope.jsontechnology.com/api/health
 curl -sS 'https://vulnscope.jsontechnology.com/api/research?cve=CVE-2023-22527'
+curl -sS -X POST https://vulnscope.jsontechnology.com/api/github/scan \
+  -H 'content-type: application/json' \
+  --data '{"url":"https://github.com/jaysonguglietta/VulnScope"}'
 curl -i -X POST https://vulnscope.jsontechnology.com/api/research
 ```
 
@@ -171,6 +203,9 @@ Expected behavior:
 - Static content returns CSP, HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, Referrer Policy, and Permissions Policy.
 - Health reports source states truthfully as observed, optional, or not yet checked.
 - Valid research returns JSON; invalid CVE IDs return `400`.
+- A valid public repository returns inventory and source results; malformed,
+  non-GitHub, private, or extra-path repository URLs fail without an arbitrary
+  outbound request.
 - A method not present in API Gateway returns `404`, while the local API handler returns `405` for a known route with a disallowed method.
 
 Validate infrastructure before deployment:
@@ -193,12 +228,13 @@ that explicit list fail the infrastructure job.
 
 For a few requests per day, this avoids continuously running compute:
 
-- S3 and CloudFront charge for small storage and request volume.
+- S3, CloudFront, and the CloudFront-associated WAF charge for storage, requests,
+  data transfer, Web ACL/rule capacity, and evaluated web requests.
 - HTTP API and Lambda charge per request/invocation.
 - ACM public certificates have no separate certificate charge.
 - Conditional DynamoDB, EventBridge, SNS, and monitor Lambda usage should remain small for a short CVE list and daily schedule.
 
-The `$10` and `$20` alarms are account-level estimated-charge alarms, not hard spending limits. Unexpected traffic can accrue charges before an email is read. AWS WAF is intentionally omitted to preserve the low baseline cost; API Gateway throttling, Lambda concurrency, and application limits are the current abuse-cost controls.
+The `$10` and `$20` alarms are account-level estimated-charge alarms, not hard spending limits. Unexpected traffic can accrue charges before an email is read. The current template includes a CloudFront WAF rate-based rule and AWS managed known-bad-input rule group. API Gateway throttling, Lambda concurrency, and application limits provide additional abuse-cost controls.
 
 ## Source Tokens
 
@@ -208,7 +244,14 @@ The production stack works without optional tokens. These improve source coverag
 - `GITHUB_TOKEN`
 - `VULNCHECK_API_TOKEN`
 
-Never commit them or add them to frontend files. For production, use Secrets Manager or another approved secret-injection path and tightly scoped IAM. The current template does not provision those secrets.
+`GITHUB_TOKEN` is a server-side optional read/research token for public API rate
+limits. It is not the analyst token used for issue creation. The issue token is
+entered only in the browser, should be repository-restricted with **Issues: Read
+and write**, and must not be configured as a server environment variable.
+
+Never commit source tokens or add them to frontend files. For production, use
+Secrets Manager or another approved secret-injection path and tightly scoped
+IAM. The current template does not provision those secrets.
 
 ## Evidence Inputs
 
@@ -282,3 +325,13 @@ Set `TRUST_PROXY=1` only when the direct peer is loopback and that proxy exclusi
 ## Known Boundary
 
 Server-side case, SBOM, inventory, and browser-watchlist storage remain disabled until authentication and authorization exist. This prevents an unauthenticated shared data store from becoming an exposure or cross-user access problem.
+
+Private repository scanning is also excluded. Adding it requires an authenticated
+GitHub App or equivalent installation model, tenant-aware authorization,
+repository allowlists, encrypted credential storage, revocation handling, and
+an audit trail. Do not extend the current anonymous endpoint with a shared
+private-repository token.
+
+See [Public GitHub Repository Scanning](github-repository-scanning.md) for the
+analyst workflow, supported inventory formats, interpretation guidance, and
+failure recovery.
