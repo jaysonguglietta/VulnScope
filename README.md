@@ -28,6 +28,25 @@ Production: [https://vulnscope.jsontechnology.com](https://vulnscope.jsontechnol
 - Optionally enriches package URLs and ecosystems against OSV after explicit confirmation, including aliases, matching affected ranges, and package-specific fixed-version candidates with provenance.
 - Preserves CycloneDX VEX analysis and applies VEX status to exposure prioritization.
 
+### Public GitHub repository scanning
+
+- Accepts only canonical public `https://github.com/owner/repository` URLs and retrieves GitHub's generated SPDX dependency graph when available.
+- Falls back to bounded, read-only lockfile inspection when Dependency Graph is disabled. Exact pins are supported from npm, pip/Pipenv, Composer, Go, Cargo, and Bundler lock formats.
+- Queries versioned package identifiers against OSV and groups package-specific matches by CVE for analyst confirmation.
+- Generates one remediation issue per confirmed CVE, including detected versions, known fixes, OSV records, references, and validation steps.
+- Checks for an existing CVE issue before publishing. A fine-grained token with repository-scoped **Issues: Read and write** permission is held only in browser memory and sent directly to `api.github.com`.
+- Provides prefilled GitHub issue drafts when automatic publishing is not desired.
+
+Typical workflow: open **Scan GitHub repository**, paste the public repository
+URL, run the scan, review package-specific CVE matches, select up to 10 findings,
+and review the generated issues. Automatic publishing requires a fine-grained
+token restricted to the destination repository with **Issues: Read and write**;
+manual prefilled issue drafts do not require a token in VulnScope.
+
+See [Public GitHub Repository Scanning](docs/github-repository-scanning.md) for
+the complete workflow, supported lockfiles, limits, token boundary, API contract,
+failure recovery, and interpretation guidance.
+
 ### Exposure workspace
 
 - Combines SBOM packages, OSV results, imported cloud findings, VEX statements, cases, watchlist entries, and bulk-research results.
@@ -54,6 +73,8 @@ Raw SBOM, cloud finding, and VEX files are parsed locally and retained only in m
 
 OSV enrichment is a separate, explicit action. After confirmation, VulnScope sends only normalized package identifiers, ecosystems, and versions to the server, which queries OSV. Do not enrich package metadata that your policy treats as confidential.
 
+Public repository scans send the canonical repository name to the VulnScope server, which requests GitHub's public dependency-graph SBOM or supported public lockfiles and sends only exact versioned package identifiers to OSV. The optional issue-publishing token is never sent to VulnScope or persisted; the browser sends it directly to GitHub and discards it after the publishing action.
+
 Suppressive VEX claims require an exact product identity match and explicit analyst approval during import. Unapproved `Not affected` and `Fixed` claims remain visible as `Needs verification` and do not lower exposure priority.
 
 Case notes and watchlist entries are stored in browser local storage and pruned after 90 days. Authentication and request logging are intentionally excluded; do not treat this deployment as a shared confidential case-management system.
@@ -75,7 +96,10 @@ Optional source tokens improve coverage or rate limits:
 NVD_API_KEY=... GITHUB_TOKEN=... VULNCHECK_API_TOKEN=... npm start
 ```
 
-Use `.env.example` as a reference and do not commit real secrets.
+The server-side `GITHUB_TOKEN` is optional read access for public GitHub research
+and API rate limits. It is separate from the ephemeral issue-writing token
+entered in the browser. Use `.env.example` as a reference and do not commit real
+secrets.
 
 ## Verify
 
@@ -88,7 +112,7 @@ Verification includes server and browser-module syntax checks, API security smok
 ## Security Defaults
 
 - Security headers include CSP, HSTS in production, frame blocking, referrer policy, permissions policy, and content-sniffing protection.
-- Research and enrichment requests have per-client and CloudFront WAF rate limits, bounded queues, request-body limits, aggregate enrichment budgets, upstream response limits, and allowlisted API methods.
+- Research, enrichment, and public repository scan requests have per-client and CloudFront WAF rate limits, bounded queues, request-body limits, aggregate enrichment budgets, upstream response limits, and allowlisted API methods.
 - AWS API Gateway throttles the stage to 2 requests per second with a burst of 5; API Lambda reserved concurrency is 2.
 - CloudFront supplies a deployment-only origin secret, so direct calls to the public API Gateway endpoint are rejected.
 - Client identity uses the trusted API Gateway source address. Arbitrary forwarded headers are not trusted from public clients.
@@ -120,4 +144,4 @@ See [docs/deployment.md](docs/deployment.md) for the resource inventory, route a
 
 ## Limitations
 
-VulnScope is a research and prioritization console, not an authenticated scanner or proof of exploitability. Search matches, public chatter, inferred cloud services, imported findings, and package-version ranges can be incomplete or wrong. Confirm decisions against vendor advisories, authoritative inventory, scanner evidence, compensating controls, and production telemetry.
+VulnScope is a research and prioritization console, not an authenticated scanner or proof of exploitability. Repository scanning supports public repositories only and evaluates dependencies represented in GitHub's generated SBOM or a bounded set of exact-version lockfiles; it does not perform SAST, secret scanning, reachability analysis, or dynamic testing. Unsupported lockfiles, unpinned manifests, scan limits, and upstream outages can produce incomplete coverage. Search matches, public chatter, inferred cloud services, imported findings, and package-version ranges can be incomplete or wrong. Confirm decisions against vendor advisories, authoritative inventory, scanner evidence, compensating controls, and production telemetry.

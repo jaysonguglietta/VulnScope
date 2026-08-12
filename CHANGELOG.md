@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Add bounded public GitHub dependency-graph scanning with OSV CVE matching.
+- Fall back to bounded public lockfile inspection when GitHub's generated SBOM is unavailable.
+- Add analyst confirmation, duplicate checks, prefilled issue drafts, and direct
+  GitHub issue publishing with an ephemeral fine-grained token.
+- Document the complete analyst workflow, supported lockfile fallback, scan
+  limits, token separation, API contract, recovery paths, and security boundary.
+- Correct the deployment cost notes to reflect the CloudFront WAF resources in
+  the current production template.
+
 ## 0.3.0 - 2026-08-11
 
 Security hardening release for VulnScope's public research API, browser evidence
