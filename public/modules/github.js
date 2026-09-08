@@ -1,3 +1,4 @@
+import { PackageURL } from "packageurl-js";
 const CVE_PATTERN = /^CVE-\d{4}-\d{4,}$/i;
 const SEVERITY_ORDER = new Map([
   ["CRITICAL", 5],
@@ -11,9 +12,10 @@ const SEVERITY_ORDER = new Map([
 export function buildRepositoryCveFindings(scan) {
   const findings = new Map();
   for (const pkg of arrayValue(scan?.packages).slice(0, 500)) {
-    for (const vulnerability of arrayValue(pkg?.vulnerabilities).slice(0, 100)) {
+    for (const vulnerability of arrayValue(pkg?.vulnerabilities)) {
       const cves = unique(arrayValue(vulnerability?.cves)
         .concat(arrayValue(vulnerability?.aliases))
+        .concat(vulnerability?.id || "")
         .map((value) => String(value || "").toUpperCase())
         .filter((value) => CVE_PATTERN.test(value)));
       for (const cve of cves) {
@@ -36,7 +38,7 @@ export function buildRepositoryCveFindings(scan) {
         finding.references.push(...arrayValue(vulnerability?.references).map((reference) => reference?.url).filter(isSafeHttpUrl));
         finding.withdrawn = finding.withdrawn && Boolean(vulnerability?.withdrawn);
         finding.packages.push({
-          key: String(pkg?.purl || `${pkg?.ecosystem || "package"}:${pkg?.name || "unknown"}@${pkg?.version || "unknown"}`),
+          key: JSON.stringify([pkg?.purl || "", pkg?.ecosystem || "", pkg?.name || "", pkg?.version || "", pkg?.fileName || ""]),
           name: String(pkg?.name || packageNameFromPurl(pkg?.purl) || "Unknown package"),
           version: String(pkg?.version || packageVersionFromPurl(pkg?.purl) || "Unknown"),
           purl: String(pkg?.purl || ""),
@@ -51,7 +53,7 @@ export function buildRepositoryCveFindings(scan) {
   return [...findings.values()].map((finding) => ({
     ...finding,
     summaries: unique(finding.summaries).slice(0, 5),
-    packages: uniqueBy(finding.packages, (pkg) => pkg.key.toLowerCase()).slice(0, 100),
+    packages: mergePackageAdvisories(finding.packages),
     advisoryIds: unique(finding.advisoryIds).slice(0, 50),
     references: unique(finding.references).slice(0, 20)
   })).sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.cve.localeCompare(b.cve));
@@ -124,12 +126,20 @@ function severityRank(value) {
 }
 
 function packageNameFromPurl(value) {
-  const path = String(value || "").split(/[?#]/)[0].replace(/^pkg:[^/]+\//i, "").split("@")[0];
-  return safeDecode(path.split("/").pop() || "");
+  try { const pkg = PackageURL.fromString(value); return [pkg.namespace, pkg.name].filter(Boolean).join("/"); } catch { return ""; }
 }
 
 function packageVersionFromPurl(value) {
-  return safeDecode(String(value || "").match(/@([^?#]+)(?:[?#]|$)/)?.[1] || "");
+  try { return PackageURL.fromString(value).version || ""; } catch { return ""; }
+}
+
+function mergePackageAdvisories(packages) {
+  const rows = new Map();
+  for (const pkg of packages) {
+    const old = rows.get(pkg.key);
+    rows.set(pkg.key, { ...pkg, fixedVersions: unique([...(old?.fixedVersions || []), ...pkg.fixedVersions]), advisoryIds: unique([...(old?.advisoryIds || []), pkg.advisoryId]) });
+  }
+  return [...rows.values()];
 }
 
 function safeDecode(value) {

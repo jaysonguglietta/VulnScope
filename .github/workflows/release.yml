@@ -26,18 +26,20 @@ jobs:
 
       - name: Verify source
         run: |
-          npm ci
+          npm ci --ignore-scripts
           npm run verify
           npm audit signatures
 
-      - name: Build Lambda artifact
+      - name: Verify browser release workflows
         run: |
-          rm -rf .deploy
-          mkdir -p .deploy/lambda
-          cp server.mjs lambda.mjs monitor.mjs package.json package-lock.json .deploy/lambda/
-          npm ci --prefix .deploy/lambda --omit=dev --ignore-scripts
-          (cd .deploy/lambda && zip -qr ../lambda.zip .)
-          sha256sum .deploy/lambda.zip > .deploy/lambda.zip.sha256
+          npx playwright install --with-deps chromium
+          npm run test:browser
+
+      - name: Build complete deployment artifact
+        run: npm run build:release
+
+      - name: Verify extracted runtime
+        run: npm run test:bundle
 
       - name: Generate release SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -52,7 +54,7 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: |
-            .deploy/lambda.zip
+            .deploy/deployment.tar.gz
             .deploy/vulnscope-lambda.spdx.json
 
       - name: Upload verified release bundle
@@ -60,8 +62,8 @@ jobs:
         with:
           name: vulnscope-${{ github.sha }}
           path: |
-            .deploy/lambda.zip
-            .deploy/lambda.zip.sha256
+            .deploy/deployment.tar.gz
+            .deploy/deployment.tar.gz.sha256
             .deploy/vulnscope-lambda.spdx.json
           if-no-files-found: error
           retention-days: 30

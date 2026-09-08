@@ -1,7 +1,12 @@
+import { createSbomBudget, assertSbomStructure } from "./sbom-budget.js";
+import { xmlToCycloneDx } from "./sbom-xml.js";
+
 const CVE_PATTERN = /CVE-\d{4}-\d{4,}/gi;
 
-export function parseSbomPayload(file, text) {
+export function parseSbomPayload(file, text, budget = createSbomBudget()) {
   const source = String(text || "");
+  if (new TextEncoder().encode(source).byteLength > 10 * 1024 * 1024) throw new Error("SBOM exceeds 10 MiB.");
+  budget.spend(0);
   const trimmed = source.trim();
   const base = {
     fileName: String(file?.name || "sbom"),
@@ -14,19 +19,16 @@ export function parseSbomPayload(file, text) {
     warnings: []
   };
   if (!trimmed) return { handled: true, parsed: { ...base, warnings: [`${base.fileName} is empty.`] } };
-  if (trimmed.startsWith("<")) return { handled: false, reason: "XML uses the browser DOM parser fallback." };
-  if (/^[\[{]/.test(trimmed)) {
-    try {
-      return { handled: true, parsed: parseJson(base, JSON.parse(trimmed), source) };
-    } catch (error) {
-      return {
-        handled: true,
-        parsed: { ...base, cves: extractCves(source), warnings: [`${base.fileName} is not valid JSON: ${safeMessage(error)}.`] }
-      };
-    }
+  if (trimmed.startsWith("<")) return { handled: true, parsed: parseCycloneDx(base, xmlToCycloneDx(source), budget) };
+  if (/^[\\[{]/.test(trimmed)) {
+    const value = JSON.parse(trimmed);
+    assertSbomStructure(value);
+    const parsed = parseJson(base, value, source, budget);
+    budget.check(parsed);
+    return { handled: true, parsed };
   }
   if (/^SPDXVersion:/m.test(source) || /^PackageName:/m.test(source)) {
-    return { handled: true, parsed: parseSpdxTagValue(base, source) };
+    return { handled: true, parsed: parseSpdxTagValue(base, source, budget) };
   }
   return {
     handled: true,
@@ -34,15 +36,16 @@ export function parseSbomPayload(file, text) {
   };
 }
 
-function parseJson(base, json, text) {
-  if (json?.bomFormat === "CycloneDX") return parseCycloneDx(base, json);
-  if (json?.spdxVersion || (Array.isArray(json?.packages) && json?.SPDXID)) return parseSpdx(base, json);
-  if (Array.isArray(json?.artifacts) && (json?.descriptor?.name === "syft" || json?.source)) return parseSyft(base, json);
-  if (Array.isArray(json?.matches)) return parseGrype(base, json);
-  return parseGeneric(base, json, text);
+function parseJson(base, json, text, budget) {
+  if (json?.bomFormat === "CycloneDX") return parseCycloneDx(base, json, budget);
+  if (json?.spdxVersion || (Array.isArray(json?.packages) && json?.SPDXID)) return parseSpdx(base, json, budget);
+  if (Array.isArray(json?.artifacts) && (json?.descriptor?.name === "syft" || json?.source)) return parseSyft(base, json, budget);
+  if (Array.isArray(json?.matches)) return parseGrype(base, json, budget);
+  return parseGeneric(base, json, text, budget);
 }
 
-function parseCycloneDx(base, json) {
+function parseCycloneDx(base, json, budget) {
+  budget.spend(arrayValue(json.components || json.packages || json.artifacts || json.matches).length);
   const byRef = new Map();
   const components = arrayValue(json.components).slice(0, 100000).map((entry) => {
     const component = normalizeComponent({
@@ -65,6 +68,7 @@ function parseCycloneDx(base, json) {
     const ids = cves.length ? cves : /^GHSA-/i.test(vulnerability.id || "") ? [String(vulnerability.id).toUpperCase()] : [];
     const rating = highestRating(vulnerability.ratings);
     const refs = arrayValue(vulnerability.affects).map((item) => item.ref).filter(Boolean);
+    budget.spend(ids.length * (1 + refs.length + Math.ceil(stringify(vulnerability).length / 256)));
     return ids.map((id) => ({
       cve: id,
       id: vulnerability.id || id,
@@ -96,7 +100,8 @@ function parseCycloneDx(base, json) {
   };
 }
 
-function parseSpdx(base, json) {
+function parseSpdx(base, json, budget) {
+  budget.spend(arrayValue(json.components || json.packages || json.artifacts || json.matches).length);
   const components = arrayValue(json.packages).slice(0, 100000).map((entry) => {
     const refs = arrayValue(entry.externalRefs);
     return normalizeComponent({
@@ -122,7 +127,8 @@ function parseSpdx(base, json) {
   };
 }
 
-function parseSyft(base, json) {
+function parseSyft(base, json, budget) {
+  budget.spend(arrayValue(json.components || json.packages || json.artifacts || json.matches).length);
   const components = arrayValue(json.artifacts).slice(0, 100000).map((entry) => normalizeComponent({
     fileName: base.fileName,
     ref: entry.id || entry.purl,
@@ -145,7 +151,8 @@ function parseSyft(base, json) {
   };
 }
 
-function parseGrype(base, json) {
+function parseGrype(base, json, budget) {
+  budget.spend(arrayValue(json.components || json.packages || json.artifacts || json.matches).length);
   const components = [];
   const vulnerabilities = arrayValue(json.matches).slice(0, 100000).flatMap((match) => {
     const artifact = match.artifact || {};
@@ -162,6 +169,7 @@ function parseGrype(base, json) {
     if (component.name) components.push(component);
     const vulnerability = match.vulnerability || {};
     const ids = extractCves([vulnerability.id, stringify(match.relatedVulnerabilities)].join(" "));
+    budget.spend(ids.length * (2 + Math.ceil(stringify(match).length / 256)));
     return ids.map((cve) => ({
       cve,
       id: vulnerability.id || cve,
@@ -186,7 +194,8 @@ function parseGrype(base, json) {
   };
 }
 
-function parseGeneric(base, json, text) {
+function parseGeneric(base, json, text, budget) {
+  budget.spend(arrayValue(json.components || json.packages).length);
   const source = Array.isArray(json.components) ? json.components : Array.isArray(json.packages) ? json.packages : [];
   const components = source.slice(0, 100000).map((entry) => normalizeComponent({
     fileName: base.fileName,
@@ -210,7 +219,8 @@ function parseGeneric(base, json, text) {
   };
 }
 
-function parseSpdxTagValue(base, text) {
+function parseSpdxTagValue(base, text, budget) {
+  budget.spend(text.split(/\n(?=PackageName:)/g).length);
   const blocks = text.split(/\n(?=PackageName:)/g);
   const components = blocks.slice(0, 100000).map((block) => {
     const refs = [...block.matchAll(/^ExternalRef:\s+\S+\s+\S+\s+(.+)$/gm)].map((match) => match[1].trim());
@@ -277,7 +287,12 @@ function highestRating(value) {
 }
 
 function extractCves(value) {
-  return unique(String(value || "").match(CVE_PATTERN) || []).map((item) => item.toUpperCase());
+  const ids = new Set();
+  for (const match of String(value || "").matchAll(CVE_PATTERN)) {
+    ids.add(match[0].toUpperCase());
+    if (ids.size > 500) throw new Error("Too many vulnerability identifiers in one field.");
+  }
+  return [...ids];
 }
 
 function extractUrls(value) {

@@ -21,7 +21,13 @@ jobs:
           cache: npm
 
       - name: Install
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Verify
         run: npm run verify
+
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify browser workflows
+        run: npm run test:browser
