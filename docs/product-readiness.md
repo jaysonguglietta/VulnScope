@@ -117,6 +117,11 @@ headers, blocked direct API origin, expected routes, degraded upstream states,
 bounded slow requests, public repository fallback and fresh browser migration.
 The local dirty-worktree archive is for inspection, not a production attestation.
 
+GitHub CI for implementation commit `8a8d315` passed on Node 22, including both
+browser suites; the infrastructure lint/security workflow also passed. Final
+cross-import regression coverage additionally preserves each enriched SBOM file
+instance so a local suppression cannot transfer between same-named uploads.
+
 Local validation on September 8 used Node 26.8.1: syntax/build, the existing
 security/parser suites, all 11 audit regression groups, the new product model
 groups, and both Chromium suites passed. Desktop/tablet/mobile viewport

@@ -5,6 +5,7 @@ import { normalizeResearch, kevLabel, parsedPackage, matchSemverRange, packageKe
 import { Operations, requestJson } from "../public/modules/operations.js";
 import { getAsyncSbom, allowedReportDownload, reportIdFromUrl } from "../lib/github-sbom.mjs";
 import { buildRepositoryCveFindings } from "../public/modules/github.js";
+import { buildExposureRows } from "../public/modules/workspace.js";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
@@ -77,6 +78,14 @@ assert.equal(applyDecisions([{ ...row, account: "222" }], [decision])[0].priorit
 assert.equal(applyDecisions([row], [{ ...decision, approved: false }])[0].priorityScore, 90);
 assert.equal(applyDecisions([row], [{ ...decision, reviewAt: "2020-01-01" }])[0].priorityScore, 90);
 assert.equal(compareInventories({ packages: [{ name: "x", version: "1" }] }, { packages: [] }).closureVerified, false);
+const sharedPackage = { name: "same", version: "1.0.0", purl: "pkg:npm/same@1.0.0", fileName: "same.json" };
+const repeatedImports = ["first", "second"].map((id) => ({ id, title: "same.json", components: [{ ...sharedPackage, fileId: `file:${id}` }], cves: [] }));
+const repeatedEnrichment = repeatedImports.map((report) => ({ id: `enrich:${report.id}`, sbomId: report.id, packages: [{ ...sharedPackage, vulnerabilities: [{ id: cve, cves: [cve], severity: "HIGH" }] }] }));
+const repeatedRows = buildExposureRows({ sbomReports: repeatedImports, enrichmentReports: repeatedEnrichment });
+assert.equal(repeatedRows.length, 2);
+assert.notEqual(occurrenceKey(repeatedRows[0]), occurrenceKey(repeatedRows[1]));
+const scoped = applyDecisions(repeatedRows, [{ ...decision, scope: occurrenceKey(repeatedRows[0]) }]);
+assert.equal(scoped.filter((r) => r.priorityScore === 0).length, 1, "An enriched-file decision must not transfer to a different import");
 console.log("PASS FR05/11/16 version bounds, identity case, account isolation, revoke/expiry, absence is not fixed");
 
 const operations = new Operations();

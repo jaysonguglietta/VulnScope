@@ -276,10 +276,15 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
     }
   }
   for (const report of enrichmentReports) {
+    const originalReport = sbomReports.find((item) => item.id === report.sbomId);
     for (const pkg of arrayValue(report.packages)) {
+      const originals = arrayValue(originalReport?.components).filter((component) =>
+        (component.purl ? component.purl === pkg.purl : component.name === pkg.name) &&
+        (component.version || purlVersion(component.purl)) === pkg.version);
+      const occurrences = originals.length ? originals : [pkg];
       for (const vulnerability of arrayValue(pkg.vulnerabilities)) {
         const ids = vulnerability.cves?.length ? vulnerability.cves : [vulnerability.id];
-        for (const id of ids) {
+        for (const id of ids) for (const occurrence of occurrences) {
           rows.push(normalizeExposure({
             vulnerability: id,
             aliases: vulnerability.aliases,
@@ -291,8 +296,9 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
             fixProvenance: vulnerability.fixProvenance,
             purl: pkg.purl,
             source: "OSV",
-            sourceFile: pkg.fileName,
-            assetName: pkg.fileName || "Enriched SBOM",
+            sourceRecordId: occurrence.fileId || report.sbomId || report.id,
+            sourceFile: occurrence.fileName || pkg.fileName,
+            assetName: originalReport?.title || occurrence.fileName || "Enriched SBOM",
             assetType: "SBOM",
             summary: vulnerability.summary,
             references: vulnerability.references
