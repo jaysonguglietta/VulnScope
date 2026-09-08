@@ -1,0 +1,155 @@
+import assert from "node:assert/strict";
+import { IDBFactory } from "fake-indexeddb";
+import { WorkspaceStore, validateBackup, clearImportedTrust } from "../public/modules/persistence.js";
+import { normalizeResearch, kevLabel, parsedPackage, matchSemverRange, packageKey, occurrenceKey, applyDecisions, compareInventories, buildResearchClaims, caseHandoff, makePlan } from "../public/modules/research-model.js";
+import { Operations, requestJson } from "../public/modules/operations.js";
+import { getAsyncSbom, allowedReportDownload, reportIdFromUrl } from "../lib/github-sbom.mjs";
+import { buildRepositoryCveFindings } from "../public/modules/github.js";
+import { buildExposureRows } from "../public/modules/workspace.js";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+
+globalThis.localStorage = { getItem: () => null };
+const factory = new IDBFactory();
+const first = await new WorkspaceStore(factory).open();
+const second = await new WorkspaceStore(factory).open();
+const cve = "CVE-2026-900101";
+const investigation = { id: cve, title: "Fixture", risk: { level: "High", score: 80 }, confidence: {}, metrics: { kev: { listed: true }, epss: { epss: 0 }, cvss: { score: 9.8 } }, affected: [], references: [], analystActions: [], sourceResults: ["cve", "kev", "epss"].map((id) => ({ id, status: "ok" })), generatedAt: "2026-09-01T10:00:00Z" };
+const record = { id: cve, investigation };
+Object.assign(investigation, { weaknesses: [], evidence: [], timeline: [], sourceLinks: [], remediation: { advisoryRefs: [] } });
+investigation.risk.reasons = [];
+const saved = await first.put("cases", record);
+await second.put("settings", { id: "independent", value: "retained" });
+const revised = await second.put("cases", { ...saved, owner: "Second tab" }, saved.revision);
+await assert.rejects(first.put("cases", { ...saved, owner: "Stale tab" }, saved.revision), /another tab/);
+assert.equal((await first.list("cases"))[0].owner, "Second tab");
+await assert.rejects(first.remove("cases", cve, saved.revision), /another tab/);
+assert.equal(revised.revision, 2);
+console.log("PASS FR01 record transactions and cross-tab stale revision rejection");
+
+const backup = { format: "vulnscope-workspace", version: 1, records: { cases: [revised], decisions: [{ id: "decision", scope: "scope", decisionStatus: "Fixed", approved: true }] } };
+validateBackup(backup);
+assert.throws(() => validateBackup({ ...backup, version: 2 }), /version/);
+assert.throws(() => validateBackup({ ...backup, records: { cases: [{ id: cve, investigation: { id: cve } }] } }), /investigation/);
+assert.throws(() => validateBackup({ ...backup, token: "do-not-store" }), /forbidden/);
+assert.throws(() => validateBackup({ ...backup, inventory: { sbomReports: [{}], evidenceReports: [], enrichmentReports: [] } }), /SBOM/);
+await first.restore(backup);
+assert.equal((await first.list("decisions"))[0].approved, false);
+assert.equal((await first.list("cases"))[0].owner, "Second tab");
+const before = await first.list("cases");
+await assert.rejects(first.restore({ ...backup, records: { cases: [revised, revised] } }, true), /duplicate/);
+assert.deepEqual(await first.list("cases"), before);
+assert.equal(clearImportedTrust({ vexTrusted: true, trusted: true, approved: true }).trusted, false);
+await first.clear();
+assert.equal((await first.list("cases")).length, 0);
+assert.equal((await first.list("settings"))[0].id, "legacy-migration");
+first.db.close(); second.db.close();
+console.log("PASS FR02 bounded backup validation, atomic rejection, merge, imported trust reset and durable clear");
+
+const observed = normalizeResearch(investigation);
+assert.equal(observed.metrics.epss.epss, 0);
+const failure = { ...investigation, metrics: {}, sourceResults: investigation.sourceResults.map((s) => ({ ...s, status: "error" })) };
+const unknown = normalizeResearch(failure);
+assert.equal(unknown.risk.level, "Unknown");
+assert.equal(unknown.metrics.kev, null);
+assert.match(kevLabel(unknown), /Unknown/);
+const retained = normalizeResearch(failure, observed);
+assert.equal(retained.metrics.kev.listed, true);
+assert.equal(retained.observations.kev.state, "stale");
+assert.equal(retained.risk.score, 80);
+assert.equal(retained.metrics.epss.epss, 0);
+assert.equal(normalizeResearch(retained).observations.kev.state, "stale");
+const claims = await buildResearchClaims(cve, { githubAdvisories: { items: [{ id: "GHSA-fixture", description: "Full narrative\nSecond paragraph", vulnerabilities: [{ vulnerableRange: "<2", firstPatchedVersion: "2" }] }] }, references: [{ url: "https://example.com/lead" }] }, "now");
+assert.match(claims[0].body, /Second paragraph/);
+assert.equal(claims[1].authority, "Manual review required");
+const handoff = caseHandoff({ ...unknown, caseDraft: { notes: "Analyst notes", plan: { ...makePlan(unknown), steps: "Custom target steps" } } });
+assert.match(handoff, /Analyst notes/); assert.match(handoff, /Custom target steps/); assert.match(handoff, /Unknown/);
+console.log("PASS FR03/04/10 unavailable evidence, stale positives, EPSS zero, source narrative and editable handoff");
+
+assert.equal(parsedPackage("pkg:npm/%40scope/name@1.2.3").namespace, "@scope");
+assert.notEqual(packageKey({ name: "Case", ecosystem: "Go", version: "1" }), packageKey({ name: "case", ecosystem: "Go", version: "1" }));
+assert.match(matchSemverRange("1.9.9", { version: "1.0.0", lessThan: "2.0.0", versionType: "semver", status: "affected" }), /^Matches/);
+assert.match(matchSemverRange("2.0.0", { version: "1.0.0", lessThan: "2.0.0", versionType: "semver", status: "affected" }), /^Outside/);
+assert.match(matchSemverRange("1:2.0-4", { version: "1.0", versionType: "rpm" }), /^Unknown/);
+const row = { vulnerability: cve, purl: "pkg:npm/x@1.0.0", packageName: "x", installedVersion: "1.0.0", assetId: "same", account: "111", region: "east", sourceRecordId: "record", priorityScore: 90, priority: "Critical" };
+const decision = { scope: occurrenceKey(row), approved: true, decisionStatus: "Fixed", reviewAt: "2099-01-01", reason: "Verified running artifact" };
+assert.equal(applyDecisions([row], [decision])[0].priorityScore, 0);
+assert.equal(applyDecisions([{ ...row, account: "222" }], [decision])[0].priorityScore, 90);
+assert.equal(applyDecisions([row], [{ ...decision, approved: false }])[0].priorityScore, 90);
+assert.equal(applyDecisions([row], [{ ...decision, reviewAt: "2020-01-01" }])[0].priorityScore, 90);
+assert.equal(compareInventories({ packages: [{ name: "x", version: "1" }] }, { packages: [] }).closureVerified, false);
+const sharedPackage = { name: "same", version: "1.0.0", purl: "pkg:npm/same@1.0.0", fileName: "same.json" };
+const repeatedImports = ["first", "second"].map((id) => ({ id, title: "same.json", components: [{ ...sharedPackage, fileId: `file:${id}` }], cves: [] }));
+const repeatedEnrichment = repeatedImports.map((report) => ({ id: `enrich:${report.id}`, sbomId: report.id, packages: [{ ...sharedPackage, vulnerabilities: [{ id: cve, cves: [cve], severity: "HIGH" }] }] }));
+const repeatedRows = buildExposureRows({ sbomReports: repeatedImports, enrichmentReports: repeatedEnrichment });
+assert.equal(repeatedRows.length, 2);
+assert.notEqual(occurrenceKey(repeatedRows[0]), occurrenceKey(repeatedRows[1]));
+const scoped = applyDecisions(repeatedRows, [{ ...decision, scope: occurrenceKey(repeatedRows[0]) }]);
+assert.equal(scoped.filter((r) => r.priorityScore === 0).length, 1, "An enriched-file decision must not transfer to a different import");
+console.log("PASS FR05/11/16 version bounds, identity case, account isolation, revoke/expiry, absence is not fixed");
+
+const operations = new Operations();
+const a = operations.start("research"), b = operations.start("research");
+assert(!a.current() && a.signal.aborted && b.current());
+operations.clear(); assert(!b.current());
+let requests = 0, waitMessage = "";
+globalThis.fetch = async () => ++requests === 1 ? new Response("", { status: 429, headers: { "retry-after": "0" } }) : Response.json({ ok: true });
+assert((await requestJson("http://fixture", { onWait: (message) => { waitMessage = message; } })).ok);
+assert.match(waitMessage, /Retrying/); assert.equal(requests, 2);
+console.log("PASS FR09 latest request wins, cancellation epoch and bounded Retry-After");
+
+const jobId = "11111111-1111-1111-1111-111111111111";
+const handle = `https://api.github.com/repos/fixture/public/dependency-graph/sbom/fetch-report/${jobId}`;
+assert.equal(reportIdFromUrl(handle, "fixture", "public"), jobId);
+assert.throws(() => reportIdFromUrl(handle.replace("fixture", "elsewhere"), "fixture", "public"));
+for (const value of ["http://127.0.0.1", "https://api.github.com.evil.invalid/", "https://user@github.com/", "https://169.254.169.254/"]) assert(!allowedReportDownload(value));
+let fetchCount = 0;
+const transport = { json: async () => ({ sbom_url: handle }), read: (r) => r.text(), fetch: async () => { fetchCount++; return new Response(null, { status: 202 }); } };
+assert.equal((await getAsyncSbom({ owner: "fixture", name: "public" }, transport)).pending, true);
+transport.fetch = async () => ++fetchCount === 2 ? new Response(null, { status: 302, headers: { location: "https://raw.githubusercontent.com/fixture/report" } }) : Response.json({ packages: [] });
+assert.deepEqual((await getAsyncSbom({ owner: "fixture", name: "public", jobId }, transport)).payload.sbom.packages, []);
+transport.fetch = async () => new Response(null, { status: 302, headers: { location: "http://169.254.169.254/" } });
+await assert.rejects(getAsyncSbom({ owner: "fixture", name: "public", jobId }, transport), /not allowed/);
+console.log("PASS FR08 async pending/redirect contracts and rejected report SSRF");
+
+process.env.API_DEADLINE_MS = "250";
+const { handleApiRequest } = await import("../server.mjs");
+const ids = Array.from({ length: 137 }, (_, i) => `GHSA-product-${i}`);
+let queriedPage;
+globalThis.fetch = async (value, options) => {
+  if (String(value).endsWith("querybatch")) {
+    queriedPage = JSON.parse(options.body).queries[0].page_token;
+    return Response.json({ results: [{ vulns: ids.map((id) => ({ id })), ...(queriedPage ? {} : { next_page_token: "second-page" }) }] });
+  }
+  return Response.json({ id: String(value).split("/").at(-1), aliases: [cve], affected: [] });
+};
+let offset = 0, accumulated = [];
+for (let step = 0; step < 4; step++) {
+  const response = await handleApiRequest({ path: "/api/enrich", method: "POST", trustedClientAddress: `continuation-${step}`, body: JSON.stringify({ packages: [{ purl: "pkg:npm/fixture@1.0.0", name: "fixture", version: "1.0.0", detailOffset: offset }] }) });
+  assert.equal(response.statusCode, 200);
+  const result = JSON.parse(response.body), pkg = result.packages[0];
+  accumulated.push(...pkg.vulnerabilities);
+  assert.equal(pkg.checkStatus, "partial");
+  offset = pkg.nextDetailOffset;
+}
+assert.equal(offset, null);
+assert.equal(new Set(accumulated.map((v) => v.id)).size, 137);
+assert.equal(buildRepositoryCveFindings({ packages: [{ name: "fixture", version: "1.0.0", vulnerabilities: accumulated }] })[0].packages.length, 1);
+const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+const model = vm.createContext({ packageKey });
+vm.runInContext(appSource.slice(appSource.indexOf("async function research(")), model);
+const inventory = Array.from({ length: 51 }, (_, i) => ({ name: `package${i}`, version: "1", ecosystem: "npm" }));
+const partial = model.mergeEnrichment(null, { status: "complete", packages: inventory.slice(0, 50).map((p) => ({ ...p, checkStatus: "complete", vulnerabilities: [] })) }, inventory);
+assert.equal(partial.pending.length, 1); assert.equal(partial.status, "partial");
+const complete = model.mergeEnrichment(partial, { status: "complete", packages: [{ ...inventory[50], checkStatus: "complete", vulnerabilities: [] }] }, inventory);
+assert.equal(complete.pending.length, 0); assert.equal(complete.status, "complete");
+assert.equal(model.mergeEnrichment({ ...partial, inventoryIncomplete: true }, complete, inventory).status, "partial");
+console.log("PASS FR06/07 137 advisory detail continuation, 51-package merge and retained incomplete inventory");
+
+globalThis.fetch = async (_url, options = {}) => new Promise((_resolve, reject) => {
+  options.signal.throwIfAborted(); options.signal.addEventListener("abort", () => reject(new Error("timed out")), { once: true });
+});
+const started = Date.now();
+await handleApiRequest({ path: "/api/research", trustedClientAddress: "deadline", query: new URLSearchParams({ cve }) });
+assert(Date.now() - started < 1200, "End-to-end deadline must include upstream queue waits");
+console.log("PASS FR15 bounded API execution including queued upstream calls");

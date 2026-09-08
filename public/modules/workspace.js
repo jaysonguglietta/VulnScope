@@ -89,7 +89,7 @@ function parseAwsInspector(base, rows) {
         id: resource.id || resource.details?.awsEc2Instance?.instanceId || "",
         name: tagValue(resource.tags, "Name") || resource.id || row.resources?.[0]?.id || "AWS resource",
         type: resource.type || "AWS resource",
-        account: resource.partition || "",
+        account: row.awsAccountId || "",
         region: resource.region || "",
         source: base.fileName
       });
@@ -105,6 +105,9 @@ function parseAwsInspector(base, rows) {
             assetId: asset.id,
             assetName: asset.name,
             assetType: asset.type,
+            account: asset.account,
+            region: asset.region,
+            sourceRecordId: row.findingArn || row.id || "",
             packageName: pkg.name,
             installedVersion: pkg.version,
             fixedVersion: pkg.fixedInVersion,
@@ -259,23 +262,29 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
           installedVersion: pkg.version,
           purl: pkg.purl,
           source: "SBOM",
+          sourceRecordId: pkg.fileId || report.id,
           sourceFile: pkg.fileName || entry.files?.[0] || report.title,
           assetName: report.title,
           assetType: "SBOM",
-          vexStatus: entry.vexStatus,
-          vexTrusted: Boolean(entry.vex?.trusted),
-          vexClaimedStatus: entry.vexStatus,
-          vexTrustReason: entry.vex?.trustReason || "Embedded SBOM VEX is unverified.",
-          summary: entry.vex?.detail || entry.vex?.justification || ""
+          vexStatus: pkg.vexStatus,
+          vexTrusted: Boolean(pkg.vex?.trusted),
+          vexClaimedStatus: pkg.vexStatus,
+          vexTrustReason: pkg.vex?.trustReason || "Embedded SBOM VEX is unverified.",
+          summary: pkg.vex?.detail || ""
         }));
       }
     }
   }
   for (const report of enrichmentReports) {
+    const originalReport = sbomReports.find((item) => item.id === report.sbomId);
     for (const pkg of arrayValue(report.packages)) {
+      const originals = arrayValue(originalReport?.components).filter((component) =>
+        (component.purl ? component.purl === pkg.purl : component.name === pkg.name) &&
+        (component.version || purlVersion(component.purl)) === pkg.version);
+      const occurrences = originals.length ? originals : [pkg];
       for (const vulnerability of arrayValue(pkg.vulnerabilities)) {
         const ids = vulnerability.cves?.length ? vulnerability.cves : [vulnerability.id];
-        for (const id of ids) {
+        for (const id of ids) for (const occurrence of occurrences) {
           rows.push(normalizeExposure({
             vulnerability: id,
             aliases: vulnerability.aliases,
@@ -287,8 +296,9 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
             fixProvenance: vulnerability.fixProvenance,
             purl: pkg.purl,
             source: "OSV",
-            sourceFile: pkg.fileName,
-            assetName: pkg.fileName || "Enriched SBOM",
+            sourceRecordId: occurrence.fileId || report.sbomId || report.id,
+            sourceFile: occurrence.fileName || pkg.fileName,
+            assetName: originalReport?.title || occurrence.fileName || "Enriched SBOM",
             assetType: "SBOM",
             summary: vulnerability.summary,
             references: vulnerability.references
@@ -316,7 +326,7 @@ export function buildExposureRows({ sbomReports = [], evidenceReports = [], enri
       vexMatchedProducts: vex?.products || [],
       vexJustification: vex?.justification || vex?.impact || "",
       vexAction: vex?.action || "",
-      kev: Boolean(investigation?.metrics?.kev?.listed || row.kev),
+      kev: investigation?.metrics?.kev?.listed ?? row.kev ?? null,
       epss: investigation?.metrics?.epss?.epss ?? row.epss ?? null,
       cvss: investigation?.metrics?.cvss?.score ?? row.cvss ?? null,
       exploitStatus: investigation?.realWorld?.exploitedStatus || row.exploitStatus || "Unknown",
@@ -377,7 +387,7 @@ function normalizeExposure(value) {
     aliases: unique(arrayValue(value.aliases).map(normalizeVulnerability).filter(Boolean)),
     severity: normalizeSeverity(value.severity),
     cvss: finiteNumber(value.cvss),
-    kev: Boolean(value.kev),
+    kev: typeof value.kev === "boolean" ? value.kev : null,
     epss: finiteNumber(value.epss),
     exploitStatus: value.exploitStatus || (truthy(value.exploitAvailable) ? "Exploit evidence available" : "Unknown"),
     packageName: String(value.packageName || value.name || ""),
@@ -391,8 +401,11 @@ function normalizeExposure(value) {
     assetId: String(value.assetId || ""),
     assetName: String(value.assetName || ""),
     assetType: String(value.assetType || ""),
+    account: String(value.account || value.awsAccountId || value.subscriptionId || ""),
+    region: String(value.region || ""),
     source: String(value.source || "Imported evidence"),
     sourceFile: String(value.sourceFile || ""),
+    sourceRecordId: String(value.sourceRecordId || ""),
     summary: String(value.summary || value.title || value.description || ""),
     remediation: String(value.remediation || ""),
     workflowStatus: String(value.workflowStatus || value.status || "Needs triage"),
@@ -440,22 +453,29 @@ function dedupeExposures(rows) {
     row.purl,
     row.assetId,
     row.assetName,
-    row.sourceFile
-  ].join("|").toLowerCase()).map((row) => ({ ...row }));
+    row.account,
+    row.region,
+    row.sourceFile,
+    row.sourceRecordId
+  ].join("|")).map((row) => ({ ...row }));
 }
 
 function bestVexStatement(row, statements) {
   const identifiers = new Set([row.vulnerability, ...row.aliases].filter(Boolean));
   const candidates = statements.filter((statement) => identifiers.has(statement.vulnerability) || statement.aliases.some((alias) => identifiers.has(alias)));
-  const rowProducts = [row.purl, row.packageName, row.assetId, row.assetName]
+  const versionedPurl = /@[^/?#]+(?:[?#]|$)/.test(row.purl) ? row.purl : "";
+  const rowProducts = [versionedPurl, row.installedVersion ? row.packageName + "@" + row.installedVersion : "", row.assetId]
     .map(normalizeProductIdentity)
     .filter((value) => value.length >= 3);
-  const matched = candidates.find((statement) => statement.products.some((item) => {
+  const matched = candidates.filter((statement) => statement.products.some((item) => {
     const product = normalizeProductIdentity(item);
     if (product.length < 3) return false;
     return rowProducts.some((value) => value === product);
   }));
-  return matched;
+  if (!matched.length) return null;
+  const statuses = new Set(matched.map((statement) => statement.status));
+  if (statuses.size > 1) return { ...matched[0], status: "Needs verification", trusted: false, trustReason: "Conflicting VEX statements require a package-specific review." };
+  return { ...matched[0], trusted: matched.every((statement) => statement.trusted === true) };
 }
 
 function exposurePriority(row) {
@@ -463,9 +483,10 @@ function exposurePriority(row) {
   if (row.vexStatus === "Fixed") return 5;
   let score = row.researchRisk ?? 0;
   const severity = normalizeSeverity(row.severity);
+  if (row.researchRisk == null && severity === "Unknown" && !row.kev && row.cvss == null && row.epss == null) return null;
   if (!row.researchRisk) score += severity === "Critical" ? 50 : severity === "High" ? 35 : severity === "Medium" ? 20 : severity === "Low" ? 8 : 12;
   if (row.kev) score += 35;
-  if (/confirmed|known exploited|weaponized/i.test(row.exploitStatus)) score += 22;
+  if (/^(confirmed|known exploited|weaponized)/i.test(row.exploitStatus)) score += 22;
   if (Number.isFinite(row.epss)) score += Math.round(Math.min(1, row.epss) * 25);
   if (row.vexStatus === "Affected") score += 15;
   if (row.fixedVersion) score += 3;
@@ -473,6 +494,7 @@ function exposurePriority(row) {
 }
 
 function exposurePriorityLabel(score) {
+  if (score == null) return "Unknown";
   if (score >= 80) return "Critical";
   if (score >= 60) return "High";
   if (score >= 35) return "Medium";
@@ -606,11 +628,11 @@ function purlName(purl) {
 }
 
 function purlVersion(purl) {
-  return safeDecodeURIComponent(String(purl || "").match(/@([^?#]+)/)?.[1] || "");
+  return safeDecodeURIComponent(String(purl || "").match(/@([^/?#]+)(?:[?#]|$)/)?.[1] || "");
 }
 
 function normalizeProductIdentity(value) {
-  return safeDecodeURIComponent(String(value || "")).trim().toLowerCase();
+  return safeDecodeURIComponent(String(value || "")).trim();
 }
 
 function safeDecodeURIComponent(value) {

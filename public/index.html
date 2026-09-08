@@ -19,6 +19,7 @@
 
         <nav class="sidebar-section workspace-launcher" aria-label="Vulnerability workspaces">
           <h2>Workspaces</h2>
+          <button class="workspace-button" type="button" data-action="open-tools"><strong>Data and operations</strong><span>Backups, decisions, comparison and monitor setup</span></button>
           <button class="workspace-button" type="button" data-action="open-exposures">
             <strong>Exposure workspace</strong>
             <span>Prioritize packages and assets</span>
@@ -26,6 +27,10 @@
           <button class="workspace-button" type="button" data-action="open-bulk">
             <strong>Bulk CVE research</strong>
             <span>Queue a list of CVEs</span>
+          </button>
+          <button class="workspace-button" type="button" data-action="open-github-scan">
+            <strong>Scan GitHub repository</strong>
+            <span>Find vulnerable dependencies and file issues</span>
           </button>
           <label class="workspace-button workspace-upload" for="evidenceInput">
             <strong>Import cloud or VEX evidence</strong>
@@ -74,6 +79,7 @@
 
       <main class="main">
         <header class="topbar">
+          <nav class="mobile-workspaces" aria-label="Primary workspaces"><button class="secondary-button" data-action="open-exposures">Exposure</button><button class="secondary-button" data-action="open-bulk">Bulk</button><button class="secondary-button" data-action="open-github-scan">GitHub</button><button class="secondary-button" data-action="open-tools">Data</button></nav>
           <form id="searchForm" class="search-form" novalidate>
             <label class="sr-only" for="cveInput">CVE ID</label>
             <div class="search-field">
@@ -84,6 +90,7 @@
             <button id="researchButton" class="primary-button" type="submit">Research CVE</button>
           </form>
           <div class="quick-actions" aria-label="Example CVEs">
+            <button class="ghost-button" data-action="cancel-work">Cancel active tasks</button>
             <button class="ghost-button example-cve" type="button" data-cve="CVE-2023-22527">Confluence RCE</button>
             <button class="ghost-button example-cve" type="button" data-cve="CVE-2021-44228">Log4Shell</button>
             <button class="ghost-button example-cve" type="button" data-cve="CVE-2024-3094">XZ Utils</button>
@@ -105,11 +112,13 @@
             <label class="primary-button" for="sbomInput">Upload SBOM Files</label>
             <button class="secondary-button" type="button" data-action="open-exposures">Open Exposure Workspace</button>
             <button class="secondary-button" type="button" data-action="open-bulk">Bulk CVE Research</button>
+            <button class="secondary-button" type="button" data-action="open-github-scan">Scan GitHub Repository</button>
           </div>
         </div>
       </div>
     </template>
 
-    <script src="/app.js" type="module"></script>
+    <input id="restoreInput" type="file" class="sr-only" accept=".json,application/json" aria-label="Restore workspace backup">
+    <script src="/generated/app.js" type="module"></script>
   </body>
 </html>

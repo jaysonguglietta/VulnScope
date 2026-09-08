@@ -122,6 +122,13 @@ Resources:
           ENRICHMENT_DEADLINE_MS: "15000"
           OSV_DETAIL_CACHE_TTL_MS: "3600000"
           OSV_DETAIL_CACHE_MAX_ENTRIES: "500"
+          GITHUB_REPOSITORY_PACKAGE_MAX: "50"
+          GITHUB_REPOSITORY_SBOM_INSPECT_MAX: "20000"
+          GITHUB_REPOSITORY_TREE_INSPECT_MAX: "50000"
+          GITHUB_REPOSITORY_LOCKFILE_MAX: "10"
+          GITHUB_REPOSITORY_LOCKFILE_MAX_BYTES: "4194304"
+          GITHUB_REPOSITORY_INVENTORY_MAX_BYTES: "16777216"
+          GITHUB_REPOSITORY_INVENTORY_DEADLINE_MS: "15000"
           ORIGIN_VERIFY_SECRET: !Ref ApiOriginSecret
 
   MonitorTable:
@@ -277,6 +284,13 @@ Resources:
       RouteKey: POST /api/enrich
       Target: !Sub integrations/${HttpApiIntegration}
 
+  HttpApiGitHubScanRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /api/github/scan
+      Target: !Sub integrations/${HttpApiIntegration}
+
   HttpApiStage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
@@ -323,7 +337,7 @@ Resources:
         SecurityHeadersConfig:
           ContentSecurityPolicy:
             Override: true
-            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.github.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
           ContentTypeOptions:
             Override: true
           FrameOptions:

@@ -12,46 +12,58 @@ ROOT_DOMAIN="${ROOT_DOMAIN:-jsontechnology.com}"
 NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
 MONITORED_CVES="${MONITORED_CVES:-}"
 MONITOR_SCHEDULE="${MONITOR_SCHEDULE:-rate(1 day)}"
-LAMBDA_ARTIFACT_PATH="${LAMBDA_ARTIFACT_PATH:-}"
-LAMBDA_ARTIFACT_SHA256="${LAMBDA_ARTIFACT_SHA256:-}"
+DEPLOYMENT_BUNDLE_PATH="${DEPLOYMENT_BUNDLE_PATH:-}"
+DEPLOYMENT_BUNDLE_SHA256="${DEPLOYMENT_BUNDLE_SHA256:-}"
+RELEASE_SOURCE_SHA="${RELEASE_SOURCE_SHA:-}"
+RELEASE_SOURCE_REF="${RELEASE_SOURCE_REF:-}"
 ALLOW_LOCAL_UNSIGNED_BUILD="${ALLOW_LOCAL_UNSIGNED_BUILD:-0}"
-BUILD_DIR=".deploy/lambda"
 ORIGIN_VERIFY_SECRET="${ORIGIN_VERIFY_SECRET:-$(openssl rand -hex 32)}"
 export AWS_PROFILE
 
+MONITORED_CVES="${MONITORED_CVES}" NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL}" node --input-type=module -e '
+const ids = [...new Set(process.env.MONITORED_CVES.toUpperCase().split(/[\s,]+/).filter(Boolean))];
+const email = process.env.NOTIFICATION_EMAIL;
+if (ids.length > 25 || ids.some(id => !/^CVE-\d{4}-\d{4,}$/.test(id))) throw new Error("Select at most 25 valid monitored CVEs; no entries are silently omitted.");
+if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) throw new Error("NOTIFICATION_EMAIL is invalid.");
+'
+
 if [[ "${REGION}" != "us-east-1" ]]; then
-  echo "VulnScope CloudFront ACM certificates must be deployed from us-east-1." >&2
+  echo "VulnScope CloudFront certificates require us-east-1." >&2
   exit 1
 fi
-
-rm -rf ".deploy"
-mkdir -p "${BUILD_DIR}"
-if [[ -n "${LAMBDA_ARTIFACT_PATH}" ]]; then
-  if [[ -z "${LAMBDA_ARTIFACT_SHA256}" ]]; then
-    echo "LAMBDA_ARTIFACT_SHA256 is required with LAMBDA_ARTIFACT_PATH." >&2
+if [[ "${ALLOW_LOCAL_UNSIGNED_BUILD}" == "1" && -z "${DEPLOYMENT_BUNDLE_PATH}" ]]; then
+  echo "WARNING: explicit unsigned local deployment; no release provenance guarantee." >&2
+  npm run build:release
+  DEPLOYMENT_BUNDLE_PATH=".deploy/deployment.tar.gz"
+  DEPLOYMENT_BUNDLE_SHA256="$(shasum -a 256 "${DEPLOYMENT_BUNDLE_PATH}" | awk '{print $1}')"
+  RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
+  RELEASE_SOURCE_REF="$(git symbolic-ref HEAD)"
+else
+  : "${DEPLOYMENT_BUNDLE_PATH:?A verified whole-deployment bundle is required}"
+  : "${DEPLOYMENT_BUNDLE_SHA256:?The approved bundle checksum is required}"
+  : "${RELEASE_SOURCE_SHA:?The approved source commit is required}"
+  : "${RELEASE_SOURCE_REF:?The approved release ref is required}"
+  if [[ ! "${RELEASE_SOURCE_SHA}" =~ ^[a-f0-9]{40}$ ]] || [[ ! "${RELEASE_SOURCE_REF}" =~ ^refs/(tags/v[^[:space:]]+|heads/main)$ ]]; then
+    echo "Use a full source commit and an approved version tag or main ref." >&2
     exit 1
   fi
-  ACTUAL_ARTIFACT_SHA256="$(shasum -a 256 "${LAMBDA_ARTIFACT_PATH}" | awk '{print $1}')"
-  if [[ "${ACTUAL_ARTIFACT_SHA256}" != "${LAMBDA_ARTIFACT_SHA256}" ]]; then
-    echo "Lambda artifact checksum mismatch." >&2
-    exit 1
-  fi
-  gh attestation verify "${LAMBDA_ARTIFACT_PATH}" \
+  gh attestation verify "${DEPLOYMENT_BUNDLE_PATH}" \
     --repo jaysonguglietta/VulnScope \
     --signer-workflow jaysonguglietta/VulnScope/.github/workflows/release.yml \
+    --source-ref "${RELEASE_SOURCE_REF}" --source-digest "${RELEASE_SOURCE_SHA}" \
     --deny-self-hosted-runners >/dev/null
-  cp "${LAMBDA_ARTIFACT_PATH}" ".deploy/lambda.zip"
-elif [[ "${ALLOW_LOCAL_UNSIGNED_BUILD}" == "1" ]]; then
-  echo "WARNING: deploying an unsigned local build through the explicit break-glass path." >&2
-  cp server.mjs lambda.mjs monitor.mjs package.json package-lock.json "${BUILD_DIR}/"
-  (cd "${BUILD_DIR}" && npm ci --omit=dev --ignore-scripts >/dev/null)
-  (cd "${BUILD_DIR}" && zip -qr "../lambda.zip" .)
-else
-  echo "Refusing an unsigned production build." >&2
-  echo "Provide LAMBDA_ARTIFACT_PATH and LAMBDA_ARTIFACT_SHA256 from the GitHub release workflow." >&2
-  echo "Set ALLOW_LOCAL_UNSIGNED_BUILD=1 only for an intentional emergency build." >&2
+fi
+ACTUAL_SHA="$(shasum -a 256 "${DEPLOYMENT_BUNDLE_PATH}" | awk '{print $1}')"
+if [[ "${ACTUAL_SHA}" != "${DEPLOYMENT_BUNDLE_SHA256}" ]]; then
+  echo "Deployment bundle checksum mismatch." >&2
   exit 1
 fi
+EXTRACT_DIR="$(mktemp -d)"
+trap 'rm -rf "$EXTRACT_DIR"' EXIT
+VERIFY_OPTIONS=()
+if [[ "${ALLOW_LOCAL_UNSIGNED_BUILD}" == "1" ]]; then VERIFY_OPTIONS+=(--allow-dirty); fi
+python3 scripts/verify-bundle.py "${DEPLOYMENT_BUNDLE_PATH}" "${EXTRACT_DIR}" "${RELEASE_SOURCE_SHA}" "${RELEASE_SOURCE_REF}" ${VERIFY_OPTIONS[@]+"${VERIFY_OPTIONS[@]}"}
+RELEASE_DIR="${EXTRACT_DIR}/release"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 if [[ "${ACCOUNT_ID}" != "${EXPECTED_AWS_ACCOUNT_ID}" ]]; then
@@ -89,18 +101,18 @@ echo "  hosted zone: ${HOSTED_ZONE_ID}"
 aws cloudformation deploy \
   --region "${REGION}" \
   --stack-name "${ARTIFACT_STACK_NAME}" \
-  --template-file "infra/vulnscope-artifacts.yml" \
+  --template-file "${RELEASE_DIR}/infra/vulnscope-artifacts.yml" \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
     ArtifactBucketName="${ARTIFACT_BUCKET}" \
     ArtifactRetentionDays="${ARTIFACT_RETENTION_DAYS}"
 
-aws s3 cp ".deploy/lambda.zip" "s3://${ARTIFACT_BUCKET}/${LAMBDA_CODE_KEY}" >/dev/null
+aws s3 cp "${RELEASE_DIR}/lambda.zip" "s3://${ARTIFACT_BUCKET}/${LAMBDA_CODE_KEY}" >/dev/null
 
 aws cloudformation deploy \
   --region "${REGION}" \
   --stack-name "${STACK_NAME}" \
-  --template-file "infra/vulnscope.yml" \
+  --template-file "${RELEASE_DIR}/infra/vulnscope.yml" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
@@ -133,7 +145,7 @@ if [[ -z "${STATIC_BUCKET_OUT}" || -z "${DISTRIBUTION_ID}" ]]; then
   exit 1
 fi
 
-aws s3 sync public "s3://${STATIC_BUCKET_OUT}" \
+aws s3 sync "${RELEASE_DIR}/public" "s3://${STATIC_BUCKET_OUT}" \
   --delete \
   --cache-control "public,max-age=60" >/dev/null
 

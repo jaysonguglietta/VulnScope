@@ -1,14 +1,21 @@
 {
   "name": "vulnscope",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
+    "prestart": "npm run build:client",
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check lambda.mjs && node --check monitor.mjs",
-    "check:client": "node --check public/app.js && node --check public/evidence-worker.js && node --check public/sbom-worker.js && node --check public/modules/csv.js && node --check public/modules/date.js && node --check public/modules/sbom-worker-core.js && node --check public/modules/workspace.js",
-    "test": "node scripts/security-smoke.mjs && node scripts/sbom-parser-smoke.mjs",
-    "verify": "npm run check && npm run check:client && npm test && npm audit --omit=dev",
+    "build:client": "node scripts/build-client.mjs",
+    "build:release": "npm run build:client && node scripts/create-release.mjs",
+    "check": "node --check server.mjs && node --check lambda.mjs && node --check monitor.mjs && node --check scripts/monitor-status.mjs && node --check scripts/provider-contracts.mjs && node --check lib/github-sbom.mjs",
+    "check:client": "node --check public/app.js && node --check public/evidence-worker.js && node --check public/sbom-worker.js && node --check public/modules/csv.js && node --check public/modules/date.js && node --check public/modules/github.js && node --check public/modules/sbom-worker-core.js && node --check public/modules/sbom-budget.js && node --check public/modules/sbom-report.js && node --check public/modules/sbom-xml.js && node --check public/modules/workspace.js",
+    "test": "node scripts/security-smoke.mjs && node scripts/sbom-parser-smoke.mjs && node scripts/audit-regressions.mjs && node scripts/product-regressions.mjs && python3 scripts/release-bundle-test.py",
+    "test:browser": "npm run build:client && node scripts/run-browser-tests.mjs",
+    "monitor:status": "node scripts/monitor-status.mjs",
+    "test:providers": "node scripts/provider-contracts.mjs",
+    "test:bundle": "node scripts/test-release-runtime.mjs",
+    "verify": "npm run check && npm run check:client && npm run build:client && npm test && npm audit",
     "deploy:aws": "bash scripts/deploy-aws.sh"
   },
   "engines": {
@@ -16,6 +23,14 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1087.0",
-    "@aws-sdk/client-sns": "^3.1087.0"
+    "@aws-sdk/client-sns": "^3.1087.0",
+    "fast-xml-parser": "5.11.1",
+    "packageurl-js": "2.0.1",
+    "semver": "7.8.5"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "fake-indexeddb": "6.2.5",
+    "playwright": "1.63.0"
   }
 }

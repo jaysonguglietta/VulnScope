@@ -7,5 +7,7 @@ npm-debug.log*
 coverage/
 dist/
 .deploy/
+public/generated/
+__pycache__/
 .vscode/
 .idea/
